@@ -2077,6 +2077,10 @@ fn init_() -> Result<()> {
         // split live ranges and reload. Keeping the copies in the predecessors cut reloads by 12%
         // on the mainnet corpus.
         c"-disable-phi-elim-edge-splitting".as_ptr(),
+        // These change little or no code on the benchmarks and the mainnet corpus but still walk
+        // every machine instruction.
+        c"-disable-x86-domain-reassignment".as_ptr(),
+        c"-disable-postra-machine-licm".as_ptr(),
     ];
     args.extend(extra.iter().map(|s| s.as_ptr()));
     unsafe {
