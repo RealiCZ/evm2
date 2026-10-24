@@ -130,7 +130,7 @@ use crate::{
     trustme,
     version::{EvmFeatures, GasId},
 };
-use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec};
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec, vec::Vec};
 use alloy_consensus::transaction::Recovered;
 use alloy_eips::eip2718::Typed2718;
 use alloy_primitives::{Address, B256, Bytes, Log, LogData};
@@ -737,6 +737,15 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     #[inline]
     pub fn logs(&self) -> &[Log] {
         self.state.logs()
+    }
+
+    /// Returns the logs emitted by the current in-flight transaction mutably.
+    ///
+    /// Unlike [`Self::state_mut`], this keeps the EVM verified as `Send`, since logs are not
+    /// erased.
+    #[inline]
+    pub const fn logs_mut(&mut self) -> &mut Vec<Log> {
+        self.state.logs_mut()
     }
 
     /// Returns the precompile provider.
