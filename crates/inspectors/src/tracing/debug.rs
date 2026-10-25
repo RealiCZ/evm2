@@ -282,11 +282,13 @@ impl DebugInspector {
                     .into()
             }
             Self::FlatCallTracer(inspector) => {
+                inspector.recover_runtime_oog_root(tx, &res.result);
                 inspector.set_transaction_gas_limit(tx.gas_limit());
                 inspector.set_transaction_caller(tx.signer());
                 inspector
                     .clone()
                     .into_parity_builder()
+                    .with_transaction_gas_used(res.result.tx_gas_used())
                     .into_localized_transaction_traces(tx_info)
                     .into()
             }
