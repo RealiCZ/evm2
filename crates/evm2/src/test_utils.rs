@@ -5,8 +5,8 @@ use crate::{
     env::{BlockEnv, BlockEnvExt, TxEnv, TxEnvExt},
     evm::{AccountLoad, SLoad, SStore, SelfDestructResult},
     interpreter::{
-        Gas, GasTracker, Host, InstrStop, Interpreter, Memory, Message, MessageExt, MessageKind,
-        MessageResult, MessageResultExt, StackBacking, Word, op,
+        Gas, Host, InstrStop, Interpreter, Memory, Message, MessageExt, MessageKind, MessageResult,
+        MessageResultExt, StackBacking, Word, op,
     },
     storage_key::{StorageKey, StorageKeyMap},
 };
@@ -209,11 +209,12 @@ impl Host<TestTypes> for TestHost {
     ) -> Result<MessageResult<TestTypes>, crate::ExecutionError> {
         // Mimics the depth limit enforced by the real host.
         if message.depth > CALL_DEPTH_LIMIT {
-            return Ok(MessageResultExt {
-                stop: InstrStop::CallTooDeep,
-                gas: GasTracker::new(message.gas_limit),
-                ..Default::default()
-            });
+            return Ok(MessageResultExt::new_answer(
+                message,
+                InstrStop::CallTooDeep,
+                Bytes::new(),
+                None,
+            ));
         }
         self.call_static_flags.push(message.is_static());
         self.calls.push(message.clone());

@@ -41,6 +41,13 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
     ///
     /// The interpreter is the currently running frame whose instruction produced the message; for
     /// the top-level message it is a frame initialized with the message itself.
+    ///
+    /// Return `Some` to answer without running the message. A zero-cost answer must carry the
+    /// frame's inherited state-gas reservoir as well as its unspent gas limit; use
+    /// [`MessageResultExt::new_answer`](crate::interpreter::MessageResultExt::new_answer) to
+    /// construct one. An answer representing real execution whose state was merged from
+    /// elsewhere must retain that execution's gas, including its reservoir and state charges.
+    /// The corresponding end hook can rewrite the answer before the caller settles it.
     #[inline]
     fn call(
         &mut self,
@@ -69,6 +76,13 @@ pub trait Inspector<T: EvmTypesHost>: NonStaticAny {
     ///
     /// The interpreter is the currently running frame whose instruction produced the message; for
     /// the top-level message it is a frame initialized with the message itself.
+    ///
+    /// Return `Some` to answer without running the message. A zero-cost answer must carry the
+    /// frame's inherited state-gas reservoir as well as its unspent gas limit; use
+    /// [`MessageResultExt::new_answer`](crate::interpreter::MessageResultExt::new_answer) to
+    /// construct one. An answer representing real execution whose state was merged from
+    /// elsewhere must retain that execution's gas, including its reservoir and state charges.
+    /// The corresponding end hook can rewrite the answer before the caller settles it.
     #[inline]
     fn create(
         &mut self,
@@ -141,7 +155,7 @@ impl<'a, T: EvmTypesHost> core::ops::DerefMut for dyn Inspector<T> + 'a {
 
 #[cfg(test)]
 mod tests {
-    use super::Inspector;
+    use super::*;
     use crate::{
         BaseEvmTypes, DatabaseError, Evm, EvmTypesHost, Precompiles, SpecId,
         bytecode::Bytecode,
@@ -244,9 +258,12 @@ mod tests {
                 return None;
             }
             self.call_depth = Some(message.depth);
-            let mut result = self.result.clone();
-            result.gas.set_remaining(message.gas_limit);
-            Some(result)
+            Some(MessageResultExt::new_answer(
+                message,
+                self.result.stop,
+                self.result.output.clone(),
+                self.result.created_address,
+            ))
         }
 
         fn call_end(
@@ -274,12 +291,12 @@ mod tests {
             message: &mut Message<BaseEvmTypes>,
         ) -> Option<MessageResult<BaseEvmTypes>> {
             self.create_depth = Some(message.depth);
-            Some(MessageResultExt {
-                stop: InstrStop::Return,
-                gas: GasTracker::new(message.gas_limit),
-                created_address: Some(self.created),
-                ..Default::default()
-            })
+            Some(MessageResultExt::new_answer(
+                message,
+                InstrStop::Return,
+                Bytes::new(),
+                Some(self.created),
+            ))
         }
 
         fn create_end(
@@ -896,11 +913,7 @@ mod tests {
                 if message.depth == 0 {
                     return None;
                 }
-                Some(MessageResultExt {
-                    stop: InstrStop::Revert,
-                    gas: GasTracker::new(message.gas_limit),
-                    ..Default::default()
-                })
+                Some(MessageResultExt::new_answer(message, InstrStop::Revert, Bytes::new(), None))
             }
 
             fn call_end(
@@ -1056,11 +1069,7 @@ mod tests {
                 _interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
                 message: &mut Message<BaseEvmTypes>,
             ) -> Option<MessageResult<BaseEvmTypes>> {
-                Some(MessageResultExt {
-                    stop: InstrStop::Revert,
-                    gas: GasTracker::new(message.gas_limit),
-                    ..Default::default()
-                })
+                Some(MessageResultExt::new_answer(message, InstrStop::Revert, Bytes::new(), None))
             }
 
             fn create_end(
@@ -1432,11 +1441,7 @@ mod tests {
                 } else {
                     return None;
                 }
-                Some(MessageResultExt {
-                    stop: InstrStop::Return,
-                    gas: GasTracker::new(message.gas_limit),
-                    ..Default::default()
-                })
+                Some(MessageResultExt::new_answer(message, InstrStop::Return, Bytes::new(), None))
             }
 
             fn call_end(
@@ -1539,11 +1544,7 @@ mod tests {
                     }
                     _ => return None,
                 }
-                Some(MessageResultExt {
-                    stop: InstrStop::Return,
-                    gas: GasTracker::new(message.gas_limit),
-                    ..Default::default()
-                })
+                Some(MessageResultExt::new_answer(message, InstrStop::Return, Bytes::new(), None))
             }
         }
         let mut code = Vec::new();

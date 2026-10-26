@@ -1,4 +1,4 @@
-use super::{GasTracker, InstrStop, Message, Result, Word};
+use super::{GasTracker, InstrStop, Message, MessageExt, Result, Word};
 use crate::{
     BaseEvmTypes, DatabaseError, EvmFeatures, EvmTypesHost, ExecutionConfig, ExecutionError,
     HostError, SpecId,
@@ -13,8 +13,9 @@ pub type MessageResult<T = BaseEvmTypes> = MessageResultExt<<T as EvmTypesHost>:
 
 /// Result of executing a call/create message, parameterized by extension data.
 ///
-/// [`Self::gas`] is normalized for the frame's [`stop`](Self::stop) reason by the executor
-/// before it is returned, so applying a child result to its caller is just
+/// For executed frames, [`Self::gas`] is normalized for the frame's [`stop`](Self::stop) reason
+/// by the executor before it is returned. Inspector answers supply their own gas; use
+/// [`Self::new_answer`] for an answer without execution. Applying a child result to its caller is
 /// [`GasTracker::merge_child_gas`]. Use [`Self::gas_remaining_after_final_refund`] or
 /// [`Self::gas_used_after_final_refund`] for top-level transaction accounting.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -34,6 +35,37 @@ pub struct MessageResultExt<E = ()> {
 }
 
 impl<E> MessageResultExt<E> {
+    /// Answers a call or creation without executing it, with its whole gas limit unspent.
+    ///
+    /// Copies the gas limit and inherited EIP-8037 reservoir from `message` as given, including
+    /// any inspector edits, and stores `output` and `created_address` with default extension data.
+    /// This constructor changes no state and is for zero-cost answers. An answer representing real
+    /// execution must carry that execution's gas, including its reservoir and state charges, instead.
+    ///
+    /// The caller adopts the result's reservoir, so using [`GasTracker::new`] instead would discard
+    /// the inherited reservoir and bill the sender for it.
+    #[inline]
+    pub fn new_answer<M>(
+        message: &MessageExt<M>,
+        stop: InstrStop,
+        output: Bytes,
+        created_address: Option<Address>,
+    ) -> Self
+    where
+        E: Default,
+    {
+        Self {
+            stop,
+            gas: GasTracker::new_with_execution_gas_and_reservoir(
+                message.gas_limit,
+                message.reservoir,
+            ),
+            output,
+            created_address,
+            ..Self::default()
+        }
+    }
+
     /// Replaces the extension, preserving all other message result fields.
     #[inline]
     pub fn with_ext<F>(self, ext: F) -> MessageResultExt<F> {
@@ -203,5 +235,45 @@ mod tests {
         assert_eq!(result.final_refund(100, 5), 16);
         assert_eq!(result.final_refund(100, 1), 60);
         assert_eq!(result.final_refund(100, 0), 60);
+    }
+
+    #[test]
+    fn answer_copies_message_gas_output_and_address() {
+        for reservoir in [0, 7000] {
+            for stop in [InstrStop::Return, InstrStop::Revert, InstrStop::OutOfGas] {
+                for address in [None, Some(Address::with_last_byte(1))] {
+                    let mut message =
+                        MessageExt { gas_limit: 1, reservoir: 2, ext: 42u8, ..Default::default() };
+                    // The constructor uses the message as edited by the hook.
+                    message.gas_limit = 50_000;
+                    message.reservoir = reservoir;
+                    let output = Bytes::from_static(&[1, 2, 3]);
+                    let result = MessageResultExt::<u64>::new_answer(
+                        &message,
+                        stop,
+                        output.clone(),
+                        address,
+                    );
+                    assert_eq!(
+                        result,
+                        MessageResultExt {
+                            stop,
+                            gas: GasTracker::new_with_execution_gas_and_reservoir(
+                                50_000, reservoir
+                            ),
+                            output,
+                            created_address: address,
+                            ext: 0,
+                            _non_exhaustive: (),
+                        }
+                    );
+                    assert_eq!(result.gas.remaining(), 50_000);
+                    assert_eq!(result.gas.state_gas_spent(), 0);
+                    if reservoir == 0 {
+                        assert_eq!(result.gas, GasTracker::new(50_000));
+                    }
+                }
+            }
+        }
     }
 }
