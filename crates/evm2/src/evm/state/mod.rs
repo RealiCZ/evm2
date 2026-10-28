@@ -12,7 +12,7 @@ mod stream;
 mod tracked;
 
 pub(crate) use account::Account;
-pub use account::{AccountFlags, AccountHandle, AccountInfo};
+pub use account::{AccountHandle, AccountInfo};
 pub use block::BlockStateAccumulator;
 #[cfg(feature = "account-ext")]
 pub use extension::AccountExtension;
@@ -403,7 +403,7 @@ impl<'a> State<'a> {
     /// restores the account's recorded runtime warmth.
     pub fn set_account_warm(&mut self, address: &Address, warm: bool) {
         if let Some(account) = self.accounts.get_mut(address) {
-            account.flags.set(AccountFlags::WARM, warm);
+            account.is_warm = warm;
         }
     }
 
@@ -521,10 +521,7 @@ impl<'a> State<'a> {
                 // the prewarm set on load) decides coldness: an account warmed earlier this
                 // execution is a cheap warm access and must not be forced out of gas.
                 let account = entry.into_mut();
-                if skip_cold
-                    && !account.flags.contains(AccountFlags::WARM)
-                    && !inner.prewarm_set.is_warm(address)
-                {
+                if skip_cold && !account.is_warm && !inner.prewarm_set.is_warm(address) {
                     return Err(LoadError::ColdLoadSkipped);
                 }
                 Ok(account)
@@ -536,12 +533,7 @@ impl<'a> State<'a> {
                 }
                 let original = inner.database.get_account(address)?;
                 let present = original.clone();
-                Ok(entry.insert(Account {
-                    original,
-                    present,
-                    flags: if is_warm { AccountFlags::WARM } else { AccountFlags::empty() },
-                    ..Account::default()
-                }))
+                Ok(entry.insert(Account { original, present, is_warm, ..Account::default() }))
             }
         }
     }
@@ -587,12 +579,7 @@ impl<'a> State<'a> {
         if account.storage.slots.capacity() == 0 {
             account.storage.slots = storage_pool.take();
         }
-        Ok(StorageHandle::new(
-            address,
-            &mut account.storage,
-            account.flags.contains(AccountFlags::CREATED),
-            inner,
-        ))
+        Ok(StorageHandle::new(address, &mut account.storage, account.just_created, inner))
     }
 
     /// Loads a single persistent storage slot and returns a journaled mutation handle.
@@ -632,7 +619,7 @@ impl<'a> State<'a> {
             if let Some(slot) = account.storage.slots.get(key) {
                 return Ok(slot.value.current);
             }
-            if account.storage.wiped || account.flags.contains(AccountFlags::CREATED) {
+            if account.storage.wiped || account.just_created {
                 return Ok(Word::ZERO);
             }
         }
@@ -794,26 +781,35 @@ impl<'a> State<'a> {
                 unreachable!("journal length is checked above")
             };
             match entry {
-                JournalEntry::AccountChange { address, previous, previous_flags } => {
+                JournalEntry::AccountChange {
+                    address,
+                    previous,
+                    previous_is_warm,
+                    previous_is_touched,
+                    previous_is_destroyed,
+                    previous_just_created,
+                    previous_code_changed,
+                } => {
                     // Reconcile the self-destruct set with the restored destroyed flag.
-                    let was_destroyed = self
-                        .accounts
-                        .get(&address)
-                        .is_some_and(|entry| entry.flags.contains(AccountFlags::DESTROYED));
-                    let previous_destroyed = previous_flags.contains(AccountFlags::DESTROYED);
-                    if was_destroyed && !previous_destroyed {
+                    let was_destroyed =
+                        self.accounts.get(&address).is_some_and(|entry| entry.is_destroyed);
+                    if was_destroyed && !previous_is_destroyed {
                         self.selfdestructs.remove(&address);
-                    } else if !was_destroyed && previous_destroyed {
+                    } else if !was_destroyed && previous_is_destroyed {
                         self.selfdestructs.insert(address);
                     }
                     if let Some(entry) = self.accounts.get_mut(&address) {
                         entry.present = previous;
+                        entry.is_warm = previous_is_warm;
                         // EIP-161 preserves the historical Yellow Paper K.1 precompile-3 touch.
-                        let keep_touch = features.contains(EvmFeatures::EIP161)
-                            && address == Address::with_last_byte(3);
-                        let touched = if keep_touch { entry.flags } else { previous_flags }
-                            & AccountFlags::TOUCHED;
-                        entry.flags = (previous_flags - AccountFlags::TOUCHED) | touched;
+                        if !(features.contains(EvmFeatures::EIP161)
+                            && address == Address::with_last_byte(3))
+                        {
+                            entry.is_touched = previous_is_touched;
+                        }
+                        entry.is_destroyed = previous_is_destroyed;
+                        entry.just_created = previous_just_created;
+                        entry.code_changed = previous_code_changed;
                     }
                 }
                 JournalEntry::StorageChange { address, key, previous } => {
@@ -901,10 +897,9 @@ impl<'a> State<'a> {
         let eip161 = version.feature(EvmFeatures::EIP161);
         let mut finalize = Vec::new();
         for (&address, entry) in &mut self.accounts {
-            if !entry.flags.contains(AccountFlags::TOUCHED) {
+            if !mem::take(&mut entry.is_touched) {
                 continue;
             }
-            entry.flags.remove(AccountFlags::TOUCHED);
             // EIP-161 deletes touched dead accounts at transaction finalization. Before EIP-161,
             // touching a non-existent account materializes it as empty.
             let needs_finalization = if eip161 {
@@ -978,7 +973,7 @@ impl<'a> State<'a> {
         let mut accounts = self.accounts.clone();
         for (address, account) in &mut accounts {
             account.original = account.present.clone();
-            account.flags.set(AccountFlags::WARM, self.inner.prewarm_set.is_warm(address));
+            account.is_warm = self.inner.prewarm_set.is_warm(address);
             for slot in account.storage.slots.values_mut() {
                 slot.value = Tracked::new(slot.value.current);
                 slot.is_warm = false;
@@ -1007,10 +1002,8 @@ impl<'a> State<'a> {
             }
         }
         for address in child.selfdestructs {
-            let still_pending = self
-                .accounts
-                .get(&address)
-                .is_some_and(|account| account.flags.contains(AccountFlags::DESTROYED));
+            let still_pending =
+                self.accounts.get(&address).is_some_and(|account| account.is_destroyed);
             if still_pending {
                 self.inner.selfdestructs.insert(address);
             }
@@ -1066,7 +1059,8 @@ mod tests {
         let account = &state.accounts[&address];
         assert_eq!(account.original, Some(info.clone()));
         assert_eq!(account.present, Some(info));
-        assert!(account.flags.is_empty());
+        assert!(!account.is_warm);
+        assert!(!account.is_touched);
         assert!(state.journal().is_empty());
     }
 
@@ -1458,7 +1452,7 @@ mod tests {
             account.mark_destructed();
         }
         child.finalize_transaction_(Version::base(crate::SpecId::AMSTERDAM));
-        assert!(!child.accounts[&address].flags.contains(AccountFlags::DESTROYED));
+        assert!(!child.accounts[&address].is_destroyed);
         assert!(child.inner.selfdestructs.contains(&address));
 
         let mut parent = State::new(EmptyDB::default());

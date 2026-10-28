@@ -1,6 +1,6 @@
 //! Revert journal and checkpoint types.
 
-use super::{AccountFlags, AccountInfo};
+use super::AccountInfo;
 use crate::interpreter::Word;
 use alloy_primitives::Address;
 
@@ -46,8 +46,16 @@ pub enum JournalEntry {
         address: Address,
         /// Previous present account value.
         previous: Option<AccountInfo>,
-        /// Previous lifecycle flags.
-        previous_flags: AccountFlags,
+        /// Previous warm flag.
+        previous_is_warm: bool,
+        /// Previous touched flag.
+        previous_is_touched: bool,
+        /// Previous self-destructed flag.
+        previous_is_destroyed: bool,
+        /// Previous created-in-transaction flag.
+        previous_just_created: bool,
+        /// Previous code-changed flag.
+        previous_code_changed: bool,
     },
     /// Persistent storage changed.
     StorageChange {

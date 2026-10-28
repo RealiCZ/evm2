@@ -1,8 +1,7 @@
 //! Owned pending transaction state detached from the EVM.
 
 use super::{
-    Account, AccountChanges, AccountFlags, AccountInfo, StateChangeSink, StateChangeSource,
-    StorageSlot, Tracked,
+    Account, AccountChanges, AccountInfo, StateChangeSink, StateChangeSource, StorageSlot, Tracked,
 };
 use crate::interpreter::Word;
 use alloy_primitives::{
@@ -58,12 +57,11 @@ impl PendingState {
     ) {
         let code_changed = original.as_ref().map(|account| account.code_hash)
             != current.as_ref().map(|account| account.code_hash);
-        let flags = if code_changed { AccountFlags::CODE_CHANGED } else { AccountFlags::empty() };
         let account = self.accounts.entry(address).or_default();
         *account = Account {
             original,
             present: current,
-            flags,
+            code_changed,
             storage: core::mem::take(&mut account.storage),
             ..Account::default()
         };

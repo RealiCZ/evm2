@@ -22,7 +22,6 @@ alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 auto_impl.workspace = true
-bitflags.workspace = true
 derive-where.workspace = true
 thiserror.workspace = true
 typeid.workspace = true
