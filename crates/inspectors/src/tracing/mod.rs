@@ -536,6 +536,12 @@ impl TracingInspector {
 
         self.last_journal_len = interp.host().state().journal().len();
 
+        let storage_slot = if self.config.record_state_diff {
+            storage_slot(interp.stack().as_slice(), op.get())
+        } else {
+            None
+        };
+
         let step_idx = node.trace.steps.len();
         node.trace.steps.push(CallTraceStep {
             pc: interp.pc(),
@@ -558,6 +564,7 @@ impl TracingInspector {
                 .then_some(interp.gas().reservoir()),
             state_gas_spent: interp.gas().state_gas_spent(),
             storage_change: None,
+            storage_slot,
             status: None,
 
             // This is never populated in `TracingInspector`.
@@ -622,6 +629,7 @@ impl TracingInspector {
             );
         }
 
+        let address = interp.message().destination;
         let host = interp.host();
         let journal = host.state().journal();
 
@@ -655,6 +663,13 @@ impl TracingInspector {
             } else {
                 None
             };
+        }
+
+        // The slot an SLOAD read is loaded now, and the SLOAD did not change it.
+        if let Some(slot) = &mut step.storage_slot
+            && step.op.get() == op::SLOAD
+        {
+            slot.1 = host.state().get_storage(&address, &slot.0).unwrap_or_default();
         }
 
         // An out-of-gas step consumes the whole remainder, except the reentrancy sentry, which
@@ -951,6 +966,19 @@ impl From<alloy_rpc_types_eth::TransactionInfo> for TransactionContext {
             tx_index: tx_info.index.map(|idx| idx as usize),
             tx_hash: tx_info.hash,
         }
+    }
+}
+
+/// Returns the key and value of the storage slot an SSTORE is about to write, or the key of the
+/// slot an SLOAD is about to read, with a zero value that `step_end` replaces.
+fn storage_slot(stack: &[U256], op: u8) -> Option<Box<(U256, U256)>> {
+    match op {
+        op::SLOAD => Some(Box::new((*stack.last()?, U256::ZERO))),
+        op::SSTORE => {
+            let [.., value, key] = stack else { return None };
+            Some(Box::new((*key, *value)))
+        }
+        _ => None,
     }
 }
 

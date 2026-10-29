@@ -678,6 +678,11 @@ pub struct CallTraceStep {
     pub state_gas_spent: i64,
     /// Change of the contract state after step execution (effect of the SLOAD/SSTORE instructions)
     pub storage_change: Option<Box<StorageChange>>,
+    /// The key and value a geth struct log snapshots for an SLOAD or SSTORE: the value the slot
+    /// holds before an SLOAD, or the value an SSTORE writes.
+    ///
+    /// Only set if state diffs are recorded.
+    pub storage_slot: Option<Box<(U256, U256)>>,
     /// Final status of the step
     ///
     /// This is set after the step was executed.
