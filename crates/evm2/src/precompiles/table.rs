@@ -76,6 +76,20 @@ impl<T: EvmTypesHost> Precompile<T> {
     pub const fn run(&self) -> PrecompileFn<T> {
         self.data.run()
     }
+
+    /// Attaches a pure input-price query that does not execute the precompile.
+    #[inline]
+    pub fn with_required_gas(mut self, price: fn(&[u8]) -> u64) -> Self {
+        self.data = self.data.with_required_gas(price);
+        self
+    }
+
+    /// Returns the execution price if this precompile declares one; `None` means unknown.
+    /// Input validity and chain-specific size caps still need their normal checks.
+    #[inline]
+    pub fn required_gas(&self, input: &[u8]) -> Option<u64> {
+        self.data.required_gas(input)
+    }
 }
 
 fn dummy_precompile<T: EvmTypesHost>(
@@ -91,6 +105,8 @@ fn dummy_precompile<T: EvmTypesHost>(
 pub struct PrecompileData<T: EvmTypesHost = BaseEvmTypes> {
     /// Precompile implementation function.
     run: PrecompileFn<T>,
+    /// Optional price query, independent of execution and environment access.
+    required_gas: Option<fn(&[u8]) -> u64>,
     /// Precompile ID.
     id: PrecompileId,
 }
@@ -101,19 +117,19 @@ impl<T: EvmTypesHost> PrecompileData<T> {
     /// Creates precompile data.
     #[inline]
     pub const fn new(id: PrecompileId, f: PrecompileFn<T>) -> Self {
-        Self { id, run: f }
+        Self { id, run: f, required_gas: None }
     }
 
     /// Returns this precompile data with a different ID.
     #[inline]
     pub fn with_id(self, id: PrecompileId) -> Self {
-        Self { id, run: self.run }
+        Self { id, run: self.run, required_gas: self.required_gas }
     }
 
-    /// Returns this precompile data with a different implementation function.
+    /// Returns this data with a different implementation and clears the old price query.
     #[inline]
     pub fn with_run(self, f: PrecompileFn<T>) -> Self {
-        Self { id: self.id, run: f }
+        Self { id: self.id, run: f, required_gas: None }
     }
 
     /// Returns the precompile ID.
@@ -126,6 +142,19 @@ impl<T: EvmTypesHost> PrecompileData<T> {
     #[inline]
     pub const fn run(&self) -> PrecompileFn<T> {
         self.run
+    }
+
+    /// Attaches a pure input-price query for admission without running the implementation.
+    #[inline]
+    pub fn with_required_gas(mut self, price: fn(&[u8]) -> u64) -> Self {
+        self.required_gas = Some(price);
+        self
+    }
+
+    /// Returns the declared price, or `None` when the price is unknown.
+    #[inline]
+    pub fn required_gas(&self, input: &[u8]) -> Option<u64> {
+        self.required_gas.map(|price| price(input))
     }
 
     /// Executes this precompile.
@@ -678,5 +707,22 @@ mod tests {
         map.warm_addresses(&mut warm);
         assert!(warm.is_warm(&sha256_address));
         assert!(!warm.is_warm(&long));
+    }
+    #[test]
+    fn required_gas_survives_moves_but_not_replacement() {
+        fn price(input: &[u8]) -> u64 {
+            15 + 3 * (input.len() as u64).div_ceil(32)
+        }
+        let plain = IDENTITY::<BaseEvmTypes>();
+        assert_eq!(plain.required_gas(&[]), None);
+        let priced = plain.with_required_gas(price);
+        assert_eq!(priced.required_gas(&[]), Some(15));
+        assert_eq!(priced.required_gas(&[0; 33]), Some(21));
+        let moved = priced.with_address(Address::with_last_byte(0xff));
+        assert_eq!(moved.required_gas(&[0; 33]), Some(21));
+        let data = moved.into_data().with_id(PrecompileId::custom("renamed"));
+        assert_eq!(data.required_gas(&[0; 33]), Some(21));
+        let run = data.run();
+        assert_eq!(data.with_run(run).required_gas(&[0; 33]), None);
     }
 }
