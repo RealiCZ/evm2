@@ -1626,9 +1626,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let address = &message.destination;
         let mut stop = stop;
         if stop.is_success()
-            && let Err(failed) = self.validate_create_output(&mut gas, &mut output)
+            && let Err(error) = self.validate_create_output(address, &mut gas, &mut output)
         {
-            stop = failed;
+            stop = match error {
+                HostError::Halt(stop) => stop,
+                HostError::Execution(error) => return Err(error),
+            };
             output = Bytes::new();
         }
         self.hook_before_commit(message, &mut stop, &mut output, gas.tracker_mut())?;
@@ -1656,13 +1659,18 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         })
     }
 
-    fn validate_create_output(&self, gas: &mut Gas, output: &mut Bytes) -> Result<(), InstrStop> {
+    fn validate_create_output(
+        &mut self,
+        address: &Address,
+        gas: &mut Gas,
+        output: &mut Bytes,
+    ) -> Result<(), HostError> {
         if self.feature(EvmFeatures::CODE_SIZE_CHECK) && output.len() > self.version().max_code_size
         {
-            return Err(InstrStop::CreateContractSizeLimit);
+            return Err(InstrStop::CreateContractSizeLimit.into());
         }
         if self.feature(EvmFeatures::EIP3541) && output.first().is_some_and(|byte| *byte == 0xef) {
-            return Err(InstrStop::CreateContractStartingWithEF);
+            return Err(InstrStop::CreateContractStartingWithEF.into());
         }
 
         let code_deposit_gas = output
@@ -1673,7 +1681,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             if self.feature(EvmFeatures::EIP2) {
                 // EIP-2 makes code-deposit OOG fail contract creation; Frontier instead
                 // creates the account with empty code.
-                return Err(InstrStop::OutOfGas);
+                return Err(InstrStop::OutOfGas.into());
             }
             *output = Bytes::new();
             return Ok(());
@@ -1687,9 +1695,17 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         if self.feature(EvmFeatures::EIP8037) {
             let params = &self.version().gas_params;
             gas.spend(params.keccak256_word_cost(output.len()))?;
-            let code_deposit_state_gas = params.code_deposit_state_gas(output.len());
-            if code_deposit_state_gas > 0 {
-                gas.spend_state(code_deposit_state_gas)?;
+            // Empty code deposits nothing, so it is not priced.
+            if !output.is_empty() {
+                let price = T::state_gas_price(
+                    self,
+                    GasId::CodeDepositState,
+                    crate::version::StateGasSite::Account(*address),
+                )?;
+                let code_deposit_state_gas = price.saturating_mul(output.len() as u64);
+                if code_deposit_state_gas > 0 {
+                    gas.spend_state(code_deposit_state_gas)?;
+                }
             }
         }
         Ok(())
@@ -2250,7 +2266,7 @@ mod tests {
         interpreter::{GasTracker, Interpreter, Message, MessageExt, MessageKind, op},
         precompiles::{Precompile, PrecompileError, PrecompileId, PrecompileMap},
         registry::{HandlerError, TxRequest, handler},
-        test_utils::{handle_test_tx, legacy_bytecode, push_address, test_tx},
+        test_utils::{PricedTypes, Prices, handle_test_tx, legacy_bytecode, push_address, test_tx},
         utils::address_to_word,
     };
     use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
@@ -5150,5 +5166,155 @@ mod tests {
         );
 
         let _ = evm.transact_with_inspector(&test_tx(0), &mut CallCounter::default());
+    }
+
+    #[test]
+    fn empty_code_deposit_is_not_priced() {
+        for (code, priced) in [
+            (&[op::PUSH0, op::PUSH0, op::RETURN][..], false),
+            (&[op::PUSH1, 1, op::PUSH0, op::RETURN][..], true),
+        ] {
+            let created = Address::from([0x22; 20]);
+            let mut evm = Evm::<PricedTypes>::new_with_ext(
+                SpecId::AMSTERDAM,
+                BlockEnvExt::default(),
+                TxRegistry::new(),
+                InMemoryDB::default(),
+                Precompiles::base(SpecId::AMSTERDAM),
+                Prices::default(),
+            );
+            let mut message = MessageExt {
+                kind: MessageKind::Create,
+                destination: created,
+                call_target: created,
+                caller: Address::from([0x11; 20]),
+                gas_limit: 1_000_000,
+                code: Bytecode::new_legacy(Bytes::copy_from_slice(code)),
+                ..MessageExt::default()
+            };
+            let result = Host::execute_message(&mut evm, &mut message).unwrap();
+            assert_eq!(result.stop, InstrStop::Return);
+            assert_eq!(result.created_address, Some(created));
+            let deposit_priced =
+                evm.ext().seen.iter().any(|(id, _)| *id == GasId::CodeDepositState);
+            assert_eq!(deposit_priced, priced, "{code:?}");
+        }
+    }
+
+    /// Runs `code` as the first frame of `PricedTypes` on Amsterdam at `multiplier` times the
+    /// schedule's state prices; `CODE` holds 10 wei.
+    fn run_priced(
+        code: &[u8],
+        multiplier: u64,
+        fail: Option<GasId>,
+    ) -> (Result<MessageResult<PricedTypes>, ExecutionError>, Prices) {
+        const CODE: Address = Address::with_last_byte(0xc0);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            &CODE,
+            AccountInfo::default()
+                .with_balance(U256::from(10))
+                .with_code(Bytecode::new_legacy(Bytes::copy_from_slice(code))),
+        );
+        let mut evm = Evm::<PricedTypes>::new_with_ext(
+            SpecId::AMSTERDAM,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            db,
+            Precompiles::base(SpecId::AMSTERDAM),
+            Prices { multiplier, fail, ..Prices::default() },
+        );
+        let bytecode = evm.state_mut().account(&CODE).unwrap().load_code().unwrap();
+        let mut message = MessageExt {
+            kind: MessageKind::Call,
+            destination: CODE,
+            call_target: CODE,
+            code_address: CODE,
+            caller: Address::with_last_byte(0xee),
+            gas_limit: 10_000_000,
+            reservoir: 10_000_000,
+            code: bytecode,
+            ..MessageExt::default()
+        };
+        let result = Host::execute_message(&mut evm, &mut message);
+        (result, core::mem::take(evm.ext_mut()))
+    }
+
+    /// Every state charge an instruction makes is priced by the type family at its location:
+    /// SSTORE's set and refill, a value call's new account, CREATE's account and its code deposit,
+    /// SELFDESTRUCT's new beneficiary. At three times the schedule's prices the frame spends three
+    /// times the state gas, so no charge on this path bypasses the hook.
+    #[test]
+    fn instruction_state_charges_take_the_family_price() {
+        use crate::version::StateGasSite::{Account, Storage};
+        const CODE: Address = Address::with_last_byte(0xc0);
+        const NEW1: Address = Address::with_last_byte(0xe1);
+        const NEW2: Address = Address::with_last_byte(0xe2);
+        let mut code = vec![op::PUSH1, 1, op::PUSH1, 1, op::SSTORE];
+        code.extend([op::PUSH0, op::PUSH1, 1, op::SSTORE]);
+        code.extend([op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH1, 1, op::PUSH20]);
+        code.extend_from_slice(NEW1.as_slice());
+        code.extend([op::GAS, op::CALL, op::POP]);
+        // CREATE of `PUSH1 1 PUSH0 RETURN`, stored at memory 28..32.
+        code.extend([op::PUSH4, 0x60, 0x01, 0x5f, 0xf3, op::PUSH0, op::MSTORE]);
+        code.extend([op::PUSH1, 4, op::PUSH1, 28, op::PUSH0, op::CREATE, op::POP]);
+        code.push(op::PUSH20);
+        code.extend_from_slice(NEW2.as_slice());
+        code.push(op::SELFDESTRUCT);
+
+        let created = CODE.create(0);
+        let expected = vec![
+            (GasId::SstoreSetState, Storage(CODE, U256::from(1))),
+            (GasId::SstoreSetState, Storage(CODE, U256::from(1))),
+            (GasId::NewAccountState, Account(NEW1)),
+            (GasId::CreateState, Account(created)),
+            (GasId::CodeDepositState, Account(created)),
+            (GasId::NewAccountState, Account(NEW2)),
+        ];
+        let (once, prices) = run_priced(&code, 1, None);
+        let once = once.unwrap();
+        assert_eq!(once.stop, InstrStop::SelfDestruct);
+        assert_eq!(prices.seen, expected);
+        let (thrice, prices) = run_priced(&code, 3, None);
+        let thrice = thrice.unwrap();
+        assert_eq!(thrice.stop, InstrStop::SelfDestruct);
+        assert_eq!(prices.seen, expected);
+        assert!(once.gas.state_gas_spent() > 0);
+        assert_eq!(thrice.gas.state_gas_spent(), 3 * once.gas.state_gas_spent());
+    }
+
+    /// A price the type family cannot give aborts the message with its error, at an instruction's
+    /// charge and at a code deposit's, never a halt.
+    #[test]
+    fn a_failed_price_aborts_the_message() {
+        let (result, prices) = run_priced(
+            &[op::PUSH1, 1, op::PUSH1, 1, op::SSTORE, op::STOP],
+            1,
+            Some(GasId::SstoreSetState),
+        );
+        assert!(matches!(result, Err(ExecutionError::Fatal(_))), "{result:?}");
+        assert_eq!(prices.seen.len(), 1);
+
+        let mut evm = Evm::<PricedTypes>::new_with_ext(
+            SpecId::AMSTERDAM,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            InMemoryDB::default(),
+            Precompiles::base(SpecId::AMSTERDAM),
+            Prices { fail: Some(GasId::CodeDepositState), ..Prices::default() },
+        );
+        let created = Address::from([0x22; 20]);
+        let mut message = MessageExt {
+            kind: MessageKind::Create,
+            destination: created,
+            call_target: created,
+            caller: Address::from([0x11; 20]),
+            gas_limit: 1_000_000,
+            code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::RETURN])),
+            ..MessageExt::default()
+        };
+        let result = Host::execute_message(&mut evm, &mut message);
+        assert!(matches!(result, Err(ExecutionError::Fatal(_))), "{result:?}");
+        assert!(evm.state_mut().account(&created).unwrap().get().is_none(), "rolled back");
     }
 }

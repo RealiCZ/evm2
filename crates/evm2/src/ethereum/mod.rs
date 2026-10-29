@@ -27,7 +27,7 @@ use crate::{
     },
     registry::{HandlerError, HandlerResult, TxRegistry, handler},
     utils::{b256_to_word, num_words},
-    version::GasId,
+    version::{GasId, StateGasSite},
 };
 use alloy_consensus::{
     EthereumTxEnvelope, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
@@ -594,7 +594,8 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             };
             let mut code_address = to;
             if host.feature(EvmFeatures::EIP2780) && !value.is_zero() && recipient_is_empty {
-                let new_account_state_gas = host.version().gas_params.new_account_state_gas();
+                let new_account_state_gas =
+                    T::state_gas_price(host, GasId::NewAccountState, StateGasSite::Account(to))?;
                 if tx_gas.spend_state(new_account_state_gas).is_err() {
                     return Ok(halted(host));
                 }
@@ -657,7 +658,11 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 let target_alive =
                     host.state.account(&destination)?.get().is_some_and(|info| !info.is_empty());
                 if !target_alive {
-                    let create_state_gas = host.version().gas_params.create_state_gas();
+                    let create_state_gas = T::state_gas_price(
+                        host,
+                        GasId::CreateState,
+                        StateGasSite::Account(destination),
+                    )?;
                     if tx_gas.spend_state(create_state_gas).is_err() {
                         return Ok(halted(host));
                     }
@@ -1295,6 +1300,68 @@ mod tests {
         assert!(evm.transact(&tx).unwrap().commit().is_success());
         let reward = evm.read_account_info(&beneficiary).unwrap().unwrap().balance;
         assert_eq!(reward, U256::from(21_000 * beneficiary_gas_price));
+    }
+
+    /// The transaction-level state charges are priced by the type family at their location: a
+    /// value transfer's new recipient and a creation's account. At three times the schedule's
+    /// prices the transaction's tracker spends three times the state gas; a price the family
+    /// cannot give aborts the transaction.
+    #[test]
+    fn initial_frame_state_charges_take_the_family_price() {
+        use crate::{
+            test_utils::{PricedTypes, Prices},
+            version::StateGasSite::Account,
+        };
+        let caller = Address::with_last_byte(0xaa);
+        let recipient = Address::with_last_byte(0xbb);
+        let evm = |prices| {
+            Evm::<PricedTypes>::new_with_ext(
+                SpecId::AMSTERDAM,
+                BlockEnvExt::default(),
+                TxRegistry::new(),
+                InMemoryDB::default(),
+                Precompiles::base(SpecId::AMSTERDAM),
+                prices,
+            )
+        };
+        for (to, value, site) in [
+            (TxKind::Call(recipient), U256::from(1), (GasId::NewAccountState, Account(recipient))),
+            (TxKind::Create, U256::ZERO, (GasId::CreateState, Account(caller.create(0)))),
+        ] {
+            let mut spent = vec![];
+            for multiplier in [1, 3] {
+                let mut evm = evm(Prices { multiplier, ..Prices::default() });
+                let mut tx_gas =
+                    GasTracker::new_with_execution_gas_and_reservoir(1_000_000, 1_000_000);
+                let frame = prepare_initial_frame(
+                    &mut evm,
+                    caller,
+                    0,
+                    to,
+                    &Bytes::new(),
+                    value,
+                    &mut tx_gas,
+                )
+                .unwrap();
+                assert_eq!(evm.ext().seen, [site]);
+                assert_eq!(frame.charged_state_gas as i64, tx_gas.state_gas_spent());
+                spent.push(tx_gas.state_gas_spent());
+            }
+            assert!(spent[0] > 0);
+            assert_eq!(spent[1], 3 * spent[0]);
+        }
+        let mut evm = evm(Prices { fail: Some(GasId::CreateState), ..Prices::default() });
+        let mut tx_gas = GasTracker::new_with_execution_gas_and_reservoir(1_000_000, 1_000_000);
+        let result = prepare_initial_frame(
+            &mut evm,
+            caller,
+            0,
+            TxKind::Create,
+            &Bytes::new(),
+            U256::ZERO,
+            &mut tx_gas,
+        );
+        assert!(result.is_err(), "the hook's error aborts the transaction");
     }
 
     #[test]
