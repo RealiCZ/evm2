@@ -10,7 +10,6 @@ use crate::utils::{
 use alloy_consensus::crypto::secp256k1::sign_message;
 use alloy_eips::eip7702::Authorization;
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address, hex, keccak256, map::HashMap};
-use alloy_rpc_types_eth::TransactionInfo;
 use alloy_rpc_types_trace::geth::{
     CallConfig, FlatCallConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig,
     GethDebugTracerType, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
@@ -696,9 +695,9 @@ fn test_geth_mux_tracer() {
     assert!(res.result.is_success());
 
     let (ctx, inspector) = evm.ctx_inspector();
-    let frame = inspector
-        .try_into_mux_frame(&res.tx_result, ctx.db_mut(), TransactionInfo::default())
-        .unwrap();
+    let (tx, block) = (ctx.tx().envelope(), *ctx.block());
+    let frame =
+        inspector.try_into_mux_frame(&res.tx_result, &tx, &block, None, ctx.db_mut()).unwrap();
 
     assert_eq!(frame.0.len(), 5);
     assert!(frame.0.contains_key(&GethDebugTracerType::BuiltInTracer(
@@ -2307,9 +2306,9 @@ fn keccak256_preimage_tracer_runs_standalone_and_in_a_mux() {
         .unwrap();
 
     let (ctx, inspector) = evm.ctx_inspector();
-    let frame = inspector
-        .try_into_mux_frame(&res.tx_result, ctx.db_mut(), TransactionInfo::default())
-        .unwrap();
+    let (tx, block) = (ctx.tx().envelope(), *ctx.block());
+    let frame =
+        inspector.try_into_mux_frame(&res.tx_result, &tx, &block, None, ctx.db_mut()).unwrap();
     let GethTrace::JS(preimages) = &frame.0[&key] else { panic!("expected a JSON object") };
     assert_eq!(preimages.as_object().unwrap().len(), 1);
 }
@@ -2361,6 +2360,51 @@ fn keccak256_preimage_tracer_stops_recording_at_the_byte_limit() {
             Err(_) => assert!(exceeded),
         }
     }
+}
+
+#[test]
+fn mux_runs_nested_mux_and_erc7562_tracers() {
+    let (contract, db) = contract_with_code(&hex!("5f5f00"));
+    let nested = serde_json::json!({"callTracer": {}, "noopTracer": {}});
+    let nested_key = GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer);
+    let config = MuxConfig(HashMap::from_iter([
+        (GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::FourByteTracer), None),
+        (GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::Erc7562Tracer), None),
+        (nested_key.clone(), Some(GethDebugTracerConfig(nested))),
+    ]));
+    let mut evm = Context::mainnet()
+        .with_db(db)
+        .build_mainnet_with_inspector(MuxInspector::try_from_config(config).unwrap());
+    let res = evm
+        .inspect_tx(TxEnv {
+            gas_limit: 1_000_000,
+            kind: TransactTo::Call(contract),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let (ctx, inspector) = evm.ctx_inspector();
+    let (tx, block) = (ctx.tx().envelope(), *ctx.block());
+    let frame =
+        inspector.try_into_mux_frame(&res.tx_result, &tx, &block, None, ctx.db_mut()).unwrap();
+
+    assert_eq!(frame.0.len(), 3);
+    assert!(matches!(
+        frame.0[&GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::Erc7562Tracer)],
+        GethTrace::Erc7562Tracer(_)
+    ));
+    let GethTrace::MuxTracer(nested) = &frame.0[&nested_key] else {
+        panic!("expected a nested mux frame");
+    };
+    assert_eq!(nested.0.len(), 2);
+    assert!(matches!(
+        nested.0[&GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::CallTracer)],
+        GethTrace::CallTracer(_)
+    ));
+    assert!(matches!(
+        nested.0[&GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::NoopTracer)],
+        GethTrace::NoopTracer(_)
+    ));
 }
 
 /// The expected snapshots come from go-ethereum master a0cba163: the struct logger adds the slot
