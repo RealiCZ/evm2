@@ -145,6 +145,9 @@ pub mod config;
 pub mod env;
 pub mod handler;
 pub mod inspector;
+
+mod message_hooks;
+pub use message_hooks::*;
 pub mod precompile;
 pub mod registry;
 mod system;
@@ -1359,18 +1362,67 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         &mut self,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        let mut result = match message.kind {
+        let answer = T::MessageHooks::before(self, message)?;
+        let mut result =
+            if let Some(answer) = answer { answer } else { self.dispatch_message(message)? };
+        // Settle the returning frame's gas for its stop reason at this single exit,
+        // rather than in each result builder, so every consumer (parent
+        // `merge_child_gas`, top-level accounting, inspectors) reads the settled gas.
+        T::MessageHooks::unsettled(self, message, &result);
+        result.gas.settle_gas(result.stop);
+        T::MessageHooks::after(self, message, &mut result)?;
+        Ok(result)
+    }
+
+    #[inline]
+    fn dispatch_message(
+        &mut self,
+        message: &mut Message<T>,
+    ) -> Result<MessageResult<T>, ExecutionError> {
+        let result = match message.kind {
             MessageKind::Create | MessageKind::Create2 => self.execute_create_message(message),
             MessageKind::Call
             | MessageKind::CallCode
             | MessageKind::DelegateCall
             | MessageKind::StaticCall => self.execute_call_message(message),
         }?;
-        // Settle the returning frame's gas for its stop reason at this single exit,
-        // rather than in each result builder, so every consumer (parent
-        // `merge_child_gas`, top-level accounting, inspectors) reads the settled gas.
-        result.gas.settle_gas(result.stop);
         Ok(result)
+    }
+
+    /// Runs [`MessageHooks::started`], returning the result of a start it stops.
+    #[inline]
+    fn hook_started(
+        &mut self,
+        checkpoint: &StateCheckpoint,
+        message: &Message<T>,
+    ) -> Result<Option<MessageResult<T>>, ExecutionError> {
+        let Some((stop, output)) = T::MessageHooks::started(self, message)? else {
+            return Ok(None);
+        };
+        if !stop.is_success() {
+            self.state.rollback(checkpoint.clone(), self.features);
+        }
+        Ok(Some(MessageResultExt {
+            stop,
+            gas: GasTracker::new_with_execution_gas_and_reservoir(
+                message.gas_limit,
+                message.reservoir,
+            ),
+            output,
+            ..MessageResultExt::default()
+        }))
+    }
+
+    /// Runs [`MessageHooks::before_commit`] on a started message's result.
+    #[inline]
+    fn hook_before_commit(
+        &mut self,
+        message: &Message<T>,
+        stop: &mut InstrStop,
+        output: &mut Bytes,
+        gas: &mut GasTracker,
+    ) -> Result<(), ExecutionError> {
+        T::MessageHooks::before_commit(self, message, stop, output, gas)
     }
 
     /// Fires the inspector call/create hooks around message execution.
@@ -1478,13 +1530,29 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         }
         let checkpoint = self.state.checkpoint();
         if let Err(error) = self.create_message_account(message) {
-            self.state.rollback(checkpoint, self.features);
-            return match error {
-                HostError::Halt(stop) => {
-                    Ok(Self::error_message_result(stop, message.gas_limit, message.reservoir))
+            let stop = match error {
+                HostError::Halt(stop) => stop,
+                HostError::Execution(error) => {
+                    self.state.rollback(checkpoint, self.features);
+                    return Err(error);
                 }
-                HostError::Execution(error) => Err(error),
             };
+            // A failure after the checkpoint (a collision, an endowment the creator cannot pay)
+            // is a built-in result like a call's out-of-funds answer: it reaches `before_commit`.
+            let mut result = Self::error_message_result(stop, message.gas_limit, message.reservoir);
+            self.hook_before_commit(
+                message,
+                &mut result.stop,
+                &mut result.output,
+                &mut result.gas,
+            )?;
+            if !result.stop.is_success() {
+                self.state.rollback(checkpoint, self.features);
+            }
+            return Ok(result);
+        }
+        if let Some(result) = self.hook_started(&checkpoint, message)? {
+            return Ok(result);
         }
         // Empty initcode deploys an empty contract without executing the bytecode's padding STOP.
         let (stop, gas, output) = if message.code.is_empty() {
@@ -1501,7 +1569,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             let interp = self.interpreter_pool.last_mut().unwrap();
             (stop, interp.gas(), Bytes::copy_from_slice(interp.output()))
         };
-        self.finish_create_message_run(checkpoint, &message.destination, stop, gas, output)
+        self.finish_create_message_run(checkpoint, message, stop, gas, output)
     }
 
     #[inline(never)]
@@ -1550,24 +1618,22 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     fn finish_create_message_run(
         &mut self,
         checkpoint: StateCheckpoint,
-        address: &Address,
+        message: &Message<T>,
         stop: InstrStop,
         mut gas: Gas,
         mut output: Bytes,
     ) -> Result<MessageResult<T>, ExecutionError> {
-        if stop.is_success() {
-            if let Err(stop) = self.validate_create_output(&mut gas, &mut output) {
-                self.state.rollback(checkpoint, self.features);
-                return Ok(MessageResultExt {
-                    stop,
-                    gas: *gas.tracker(),
-                    output: Bytes::new(),
-                    created_address: None,
-                    ext: T::MessageResultExt::default(),
-                    _non_exhaustive: (),
-                });
-            }
+        let address = &message.destination;
+        let mut stop = stop;
+        if stop.is_success()
+            && let Err(failed) = self.validate_create_output(&mut gas, &mut output)
+        {
+            stop = failed;
+            output = Bytes::new();
+        }
+        self.hook_before_commit(message, &mut stop, &mut output, gas.tracker_mut())?;
 
+        if stop.is_success() {
             if let Err(code) = self
                 .state
                 .account(address)
@@ -1648,30 +1714,53 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         );
         if transfers_balance {
             if !self.state.transfer(&message.caller, &message.destination, &message.value)? {
-                return Ok(Self::error_message_result(
+                let mut result = Self::error_message_result(
                     InstrStop::OutOfFunds,
                     message.gas_limit,
                     message.reservoir,
-                ));
+                );
+                self.hook_before_commit(
+                    message,
+                    &mut result.stop,
+                    &mut result.output,
+                    &mut result.gas,
+                )?;
+                if !result.stop.is_success() {
+                    self.state.rollback(checkpoint, self.features);
+                }
+                return Ok(result);
             }
             self.log_eip7708_transfer(&message.caller, &message.destination, &message.value);
+        }
+        if let Some(result) = self.hook_started(&checkpoint, message)? {
+            return Ok(result);
         }
         if self.contains_precompile(message) {
             return self.execute_call_precompile(checkpoint, message);
         }
         // Empty accounts complete the call without executing the bytecode's padding STOP.
         if message.code.is_empty() {
-            return Ok(MessageResultExt {
+            let mut result = MessageResultExt {
                 stop: InstrStop::Stop,
                 gas: GasTracker::new_with_execution_gas_and_reservoir(
                     message.gas_limit,
                     message.reservoir,
                 ),
                 ..MessageResultExt::default()
-            });
+            };
+            self.hook_before_commit(
+                message,
+                &mut result.stop,
+                &mut result.output,
+                &mut result.gas,
+            )?;
+            if !result.stop.is_success() {
+                self.state.rollback(checkpoint, self.features);
+            }
+            return Ok(result);
         }
         let stop = self.run_frame(message, checkpoint.clone())?;
-        Ok(self.finish_call_message_run(checkpoint, stop))
+        self.finish_call_message_run(checkpoint, message, stop)
     }
 
     #[inline(never)]
@@ -1702,6 +1791,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 return Err(ExecutionError::Fatal(error));
             }
         };
+        let (mut stop, mut output) = (stop, output);
+        if let Err(error) = self.hook_before_commit(message, &mut stop, &mut output, &mut gas) {
+            self.state.rollback(checkpoint, self.features);
+            return Err(error);
+        }
         if !stop.is_success() {
             self.state.rollback(checkpoint, self.features);
         }
@@ -1719,23 +1813,26 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     fn finish_call_message_run(
         &mut self,
         checkpoint: StateCheckpoint,
+        message: &Message<T>,
         stop: InstrStop,
-    ) -> MessageResult<T> {
+    ) -> Result<MessageResult<T>, ExecutionError> {
         let interp = self.interpreter_pool.last_mut().unwrap();
-        let child_gas = interp.gas();
-        let output = Bytes::copy_from_slice(interp.output());
+        let mut gas = *interp.gas().tracker();
+        let mut output = Bytes::copy_from_slice(interp.output());
+        let mut stop = stop;
+        self.hook_before_commit(message, &mut stop, &mut output, &mut gas)?;
         if !stop.is_success() {
             self.state.rollback(checkpoint, self.features);
         }
 
-        MessageResultExt {
+        Ok(MessageResultExt {
             stop,
-            gas: *child_gas.tracker(),
+            gas,
             output,
             created_address: None,
             ext: T::MessageResultExt::default(),
             _non_exhaustive: (),
-        }
+        })
     }
 
     #[inline]
@@ -1772,6 +1869,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let guard = self.enter_execution();
         let mut interp: Box<Interpreter<'frame, 'a, T>> = guard.evm.interpreter_pool.pop(message);
         let interp_ref = interp.as_mut();
+        T::MessageHooks::frame_built(guard.evm, message, interp_ref.gas_mut().tracker_mut());
         guard.evm.inspect_initialize_interp(interp_ref);
         let inspector = guard.evm.active_inspector().map(|inspector| {
             // SAFETY: The inspector is stored in `self` and remains alive for the duration of the
@@ -1961,6 +2059,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         &mut self,
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
+        T::MessageHooks::enter(self, message);
         let checkpoint = self.state.checkpoint();
         let result = if self.inspector.is_some() {
             self.execute_message_inspected(message, None)
@@ -1970,6 +2069,7 @@ impl<'a, T: EvmTypes> Host<T> for Evm<'a, T> {
         if result.is_err() {
             self.state.rollback(checkpoint, self.features);
         }
+        T::MessageHooks::exit(self, message, &result);
         result
     }
 
@@ -2180,6 +2280,7 @@ mod tests {
         type TxResultExt = ();
         type BlockEnvExt = ();
         type Host<'a> = Evm<'a, Self>;
+        type MessageHooks = ();
     }
 
     #[test]
