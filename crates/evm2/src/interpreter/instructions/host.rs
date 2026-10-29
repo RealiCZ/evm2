@@ -6,7 +6,7 @@ use crate::{
         Gas, Host, InstrStop, InterpreterState, Result, StackMut, Word, private::GasInstructionCx,
     },
     utils::WordExt,
-    version::GasId,
+    version::{GasId, StateGasSite},
 };
 use alloy_primitives::{Address, B256};
 use evm2_macros::instruction;
@@ -89,13 +89,28 @@ pub fn sstore_with<T: EvmTypesHost>(
     // new != 0) also consumes state gas from the reservoir before spilling into
     // execution gas.
     if state.feature(EvmFeatures::EIP8037) {
-        gas.spend_state(state.gas_params().sstore_state_gas(&state_load))?;
+        if state.gas_params().sstore_state_gas(&state_load) != 0 {
+            let price = T::state_gas_price(
+                state.host(),
+                GasId::SstoreSetState,
+                StateGasSite::Storage(*destination, *key),
+            )
+            .map_err(|e| state.fail(e))?;
+            gas.spend_state(price)?;
+        }
 
         // EIP-8037: a 0→x→0 storage restoration returns the state gas charged for
         // the initial 0→x transition directly to the reservoir, rather than
         // routing it through the capped refund counter below.
-        let refill = state.gas_params().sstore_state_gas_refill(&state_load);
-        gas.refill_reservoir(refill);
+        if state.gas_params().sstore_state_gas_refill(&state_load) != 0 {
+            let price = T::state_gas_price(
+                state.host(),
+                GasId::SstoreSetState,
+                StateGasSite::Storage(*destination, *key),
+            )
+            .map_err(|e| state.fail(e))?;
+            gas.refill_reservoir(price);
+        }
     }
 
     // EIP-2200 and EIP-3529 refund rules, including negative refund adjustments for

@@ -679,3 +679,12 @@ mod tests {
         );
     }
 }
+
+/// State location priced by a chain's state-gas policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateGasSite {
+    /// Account leaf, delegation indicator, or deposited code at this address.
+    Account(alloy_primitives::Address),
+    /// Persistent storage slot at this address and key.
+    Storage(alloy_primitives::Address, alloy_primitives::U256),
+}

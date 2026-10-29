@@ -11,7 +11,7 @@ use crate::{
     Evm, EvmFeatures, EvmTypes, TxResult, Version,
     env::TxEnvExt,
     evm::handler::{DefaultTxHandlerHooks, GasSettlement, TxHandlerHooks},
-    interpreter::{GasTracker, InstrStop, MessageResult, gas::EIP8038_ACCOUNT_WRITE},
+    interpreter::{GasTracker, MessageResult, gas::EIP8038_ACCOUNT_WRITE},
     registry::{HandlerError, HandlerResult, TxRequest},
     version::GasId,
 };
@@ -288,7 +288,12 @@ pub trait AuthAccounting {
     /// Called for an accepted authorization before its delegation is applied. Returning
     /// out-of-gas aborts the list: the delegation is not applied and no later authority is
     /// loaded.
-    fn accepted(&mut self, authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop>;
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError>;
 }
 
 /// EIP-2780 runtime accounting: meters the state-dependent charges on the transaction-level gas
@@ -354,10 +359,24 @@ impl<'g> RuntimeAuthCharges<'g> {
 impl AuthAccounting for RuntimeAuthCharges<'_> {
     fn rejected(&mut self) {}
 
-    fn accepted(&mut self, authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop> {
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError> {
         // Non-existent authority: pay for the new account leaf's state bytes.
         if !auth.existed {
-            self.gas.spend_state(self.new_account_state_gas)?;
+            let price = if host.feature(EvmFeatures::EIP8037) {
+                T::state_gas_price(
+                    host,
+                    GasId::NewAccountState,
+                    crate::version::StateGasSite::Account(authority),
+                )?
+            } else {
+                self.new_account_state_gas
+            };
+            self.gas.spend_state(price)?;
         }
         // First write to the authority's leaf within the transaction pays `ACCOUNT_WRITE`.
         if !self.written.contains(&authority) {
@@ -370,7 +389,16 @@ impl AuthAccounting for RuntimeAuthCharges<'_> {
             && !auth.delegated_before_tx
             && !self.charged_delegation_bytes.contains(&authority)
         {
-            self.gas.spend_state(self.delegation_bytes_state_gas)?;
+            let price = if host.feature(EvmFeatures::EIP8037) {
+                T::state_gas_price(
+                    host,
+                    GasId::TxEip7702PerAuthState,
+                    crate::version::StateGasSite::Account(authority),
+                )?
+            } else {
+                self.delegation_bytes_state_gas
+            };
+            self.gas.spend_state(price)?;
             self.charged_delegation_bytes.push(authority);
         }
         Ok(())
@@ -423,7 +451,12 @@ impl AuthAccounting for AuthRefunds {
         }
     }
 
-    fn accepted(&mut self, _authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop> {
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        _host: &mut Evm<'_, T>,
+        _authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError> {
         // Existing authority: the worst-case `ACCOUNT_WRITE` execution gas was not needed. This
         // refund applies in every regime (it is the only authorization refund before EIP-8037).
         if auth.existed {
@@ -475,8 +508,10 @@ pub fn apply_auth_list<'a, T: EvmTypes, A: Eip7702Authorization>(
             accounting.rejected();
             continue;
         };
-        if accounting.accepted(authority, &auth).is_err() {
-            return Ok(true);
+        match accounting.accepted(host, authority, &auth) {
+            Ok(()) => {}
+            Err(crate::HostError::Halt(_)) => return Ok(true),
+            Err(crate::HostError::Execution(error)) => return Err(error.into()),
         }
         host.state.account(&authority)?.set_delegation(authorization.address());
     }
@@ -529,5 +564,73 @@ mod tests {
         assert_eq!(eip7702_authorization_gas(Version::base(SpecId::PRAGUE), 0), 0);
         assert_eq!(eip7702_authorization_gas(Version::base(SpecId::PRAGUE), 3), 3 * 25_000);
         assert_eq!(eip7702_authorization_gas(Version::base(SpecId::AMSTERDAM), 2), 2 * 7_816);
+    }
+
+    /// An accepted authorization's state charges are priced by the type family at the authority:
+    /// a new authority's account and its delegation bytes. At three times the schedule's prices
+    /// the list spends three times the state gas; a price the family cannot give aborts the list
+    /// with the error, not an out-of-gas.
+    #[test]
+    fn accepted_authorization_state_charges_take_the_family_price() {
+        use crate::{
+            Precompiles,
+            env::BlockEnvExt,
+            evm::InMemoryDB,
+            registry::TxRegistry,
+            test_utils::{PricedTypes, Prices},
+            version::StateGasSite::Account,
+        };
+        struct Auth(Address);
+        impl Eip7702Authorization for Auth {
+            fn chain_id(&self) -> U256 {
+                U256::ZERO
+            }
+            fn nonce(&self) -> u64 {
+                0
+            }
+            fn address(&self) -> Address {
+                Address::with_last_byte(0xde)
+            }
+            fn authority(&self) -> Option<Address> {
+                Some(self.0)
+            }
+        }
+        let authority = Address::with_last_byte(0xa1);
+        let run = |prices| {
+            let mut evm = Evm::<PricedTypes>::new_with_ext(
+                SpecId::AMSTERDAM,
+                BlockEnvExt::default(),
+                TxRegistry::new(),
+                InMemoryDB::default(),
+                Precompiles::base(SpecId::AMSTERDAM),
+                prices,
+            );
+            let version = *evm.version();
+            let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000_000, 1_000_000);
+            let (caller, recipient) =
+                (Address::with_last_byte(0xaa), Address::with_last_byte(0xbb));
+            let mut charges =
+                RuntimeAuthCharges::new(&version, &mut gas, caller, recipient, U256::ZERO);
+            let result = apply_auth_list(&mut evm, 1, [Auth(authority)], &mut charges);
+            (result, core::mem::take(&mut evm.ext_mut().seen), gas.state_gas_spent())
+        };
+        let mut spent = Vec::new();
+        for multiplier in [1, 3] {
+            let (result, seen, state_gas) = run(Prices { multiplier, ..Prices::default() });
+            assert!(!result.unwrap(), "the list is applied");
+            assert_eq!(
+                seen,
+                [
+                    (GasId::NewAccountState, Account(authority)),
+                    (GasId::TxEip7702PerAuthState, Account(authority))
+                ]
+            );
+            spent.push(state_gas);
+        }
+        assert!(spent[0] > 0);
+        assert_eq!(spent[1], 3 * spent[0]);
+        let (result, _, _) =
+            run(Prices { fail: Some(GasId::TxEip7702PerAuthState), ..Prices::default() });
+        assert!(result.is_err(), "the hook's error aborts the list: {result:?}");
     }
 }
