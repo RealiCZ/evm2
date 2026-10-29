@@ -1618,14 +1618,27 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
     ) -> Result<MessageResult<T>, ExecutionError> {
         let address = &message.destination;
         let mut stop = stop;
-        if stop.is_success()
-            && let Err(error) = self.validate_create_output(address, &mut gas, &mut output)
-        {
-            stop = match error {
-                HostError::Halt(stop) => stop,
-                HostError::Execution(error) => return Err(error),
-            };
-            output = Bytes::new();
+        if stop.is_success() {
+            let gas_before = *gas.tracker();
+            if let Err(error) = self.validate_create_output(message, &mut gas, &mut output) {
+                stop = match error {
+                    HostError::Halt(stop) => stop,
+                    HostError::Execution(error) => return Err(error),
+                };
+                output = Bytes::new();
+            } else if let Some((rejected, refusal)) =
+                T::MessageHooks::admit_code_deposit(self, message, &output, &gas_before, &mut gas)?
+            {
+                assert!(
+                    !rejected.is_success(),
+                    "code admission must reject with a non-success stop"
+                );
+                stop = rejected;
+                output = refusal;
+                if stop == InstrStop::Revert {
+                    *gas.tracker_mut() = gas_before;
+                }
+            }
         }
         self.hook_before_commit(message, &mut stop, &mut output, gas.tracker_mut())?;
 
@@ -1654,7 +1667,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
 
     fn validate_create_output(
         &mut self,
-        address: &Address,
+        message: &Message<T>,
         gas: &mut Gas,
         output: &mut Bytes,
     ) -> Result<(), HostError> {
@@ -1666,6 +1679,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             return Err(InstrStop::CreateContractStartingWithEF.into());
         }
 
+        T::MessageHooks::before_code_deposit(self, message, output, gas)?;
         let code_deposit_gas = output
             .len()
             .saturating_mul(self.version().gas_params.get(GasId::CodeDepositCost) as usize);
@@ -1691,7 +1705,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             let price = T::state_gas_price(
                 self,
                 GasId::CodeDepositState,
-                crate::version::StateGasSite::Account(*address),
+                crate::version::StateGasSite::Account(message.destination),
             )?;
             let code_deposit_state_gas = price.saturating_mul(output.len() as u64);
             if code_deposit_state_gas > 0 {

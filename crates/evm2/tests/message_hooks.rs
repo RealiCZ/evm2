@@ -110,8 +110,11 @@ impl MessageHooks<Types> for Recorder {
         Ok((m.call_target == EMPTY).then(|| (InstrStop::Revert, Bytes::from_static(b"stop"))))
     }
 
-    fn frame_built(evm: &mut Evm<'_, Types>, m: &Message<Types>, _: &mut GasTracker) {
+    fn frame_built(evm: &mut Evm<'_, Types>, m: &Message<Types>, gas: &mut GasTracker) {
         evm.ext_mut().push(format!("built {}", m.call_target));
+        if m.destination == Address::with_last_byte(0xa1) {
+            gas.set_remaining(100);
+        }
     }
 
     fn before_commit(
@@ -127,6 +130,33 @@ impl MessageHooks<Types> for Recorder {
             *out = Bytes::from_static(b"taken back");
         }
         Ok(())
+    }
+
+    fn before_code_deposit(
+        _: &mut Evm<'_, Types>,
+        m: &Message<Types>,
+        _: &Bytes,
+        gas: &mut evm2::interpreter::Gas,
+    ) -> Result<(), evm2::HostError> {
+        if m.destination == Address::with_last_byte(0xa1) {
+            gas.erase_cost(200);
+        }
+        Ok(())
+    }
+
+    fn admit_code_deposit(
+        _: &mut Evm<'_, Types>,
+        m: &Message<Types>,
+        _: &Bytes,
+        before: &GasTracker,
+        gas: &mut evm2::interpreter::Gas,
+    ) -> Result<Option<(InstrStop, Bytes)>, evm2::ExecutionError> {
+        if m.destination == Address::with_last_byte(0xa2) {
+            assert_eq!(before.remaining(), 292);
+            assert_eq!(gas.remaining(), 92);
+            return Ok(Some((InstrStop::Revert, Bytes::from_static(b"refused"))));
+        }
+        Ok(None)
     }
 
     fn after(
@@ -228,4 +258,41 @@ fn hook_errors_roll_back_state_and_pair_observers() {
         evm.ext(),
         &[format!("enter {target}"), format!("before {target}"), format!("exit {target} false"),]
     );
+}
+
+fn deploy(evm: &mut Evm<'_, Types>, address: Address, gas: u64) -> MessageResult<Types> {
+    let mut message = Message::<Types> {
+        kind: MessageKind::Create,
+        destination: address,
+        call_target: address,
+        caller: PARENT,
+        gas_limit: gas,
+        code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::RETURN])),
+        ..Default::default()
+    };
+    Host::execute_message(evm, &TxEnvExt::default(), &mut message).unwrap()
+}
+
+#[test]
+fn code_precharge_runs_before_deposit_affordability_check() {
+    let mut evm = evm();
+    let result = deploy(&mut evm, Address::with_last_byte(0xa1), 300);
+    assert_eq!(result.stop, InstrStop::Return);
+    assert_eq!(result.gas.remaining(), 92);
+    assert_eq!(result.created_address, Some(Address::with_last_byte(0xa1)));
+    let control = deploy(&mut evm, Address::with_last_byte(0xa3), 100);
+    assert_eq!(control.stop, InstrStop::OutOfGas);
+    assert_eq!(control.created_address, None);
+}
+
+#[test]
+fn code_admission_revert_restores_predeposit_gas_and_rolls_back_creation() {
+    let mut evm = evm();
+    let address = Address::with_last_byte(0xa2);
+    let result = deploy(&mut evm, address, 300);
+    assert_eq!(result.stop, InstrStop::Revert);
+    assert_eq!(result.output.as_ref(), b"refused");
+    assert_eq!(result.gas.remaining(), 292);
+    assert_eq!(result.created_address, None);
+    assert!(evm.state_mut().account(&address).unwrap().get().is_none());
 }
