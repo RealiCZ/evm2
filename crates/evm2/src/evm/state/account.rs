@@ -390,6 +390,22 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.tracked.present.as_ref()
     }
 
+    /// Returns the account information at the transaction boundary, before any frame mutated it.
+    ///
+    /// `None` means the account was absent. Loading bytecode into the present cache does not
+    /// change this baseline; committing and starting another transaction does.
+    #[inline]
+    pub const fn original(&self) -> Option<&AccountInfo> {
+        self.tracked.original.as_ref()
+    }
+
+    /// Returns whether existence or persisted account fields differ from the transaction baseline.
+    /// Storage-only writes and bytecode-cache fills do not count as account-info changes.
+    #[inline]
+    pub fn is_changed(&self) -> bool {
+        self.tracked.is_changed()
+    }
+
     /// Returns whether the account currently exists in the overlay.
     #[inline]
     pub const fn exists(&self) -> bool {
