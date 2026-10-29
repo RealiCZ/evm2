@@ -51,6 +51,9 @@ pub trait EvmTypesHost: Sized + 'static {
 
     /// Host type used by this EVM.
     type Host<'a>: Host<Self> + ?Sized;
+
+    /// Statically selected message lifecycle hooks; use `()` for the no-op policy.
+    type MessageHooks: crate::MessageHooks<Self>;
 }
 
 /// Runtime EVM type family whose host is [`Evm`] for every stored-object lifetime.
@@ -254,6 +257,7 @@ impl EvmTypesHost for BaseEvmTypes {
     type TxResultExt = ();
     type BlockEnvExt = ();
     type Host<'a> = Evm<'a, Self>;
+    type MessageHooks = ();
 }
 
 /// Base EVM configuration for an inherited base specification ID.
