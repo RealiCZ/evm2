@@ -8,7 +8,7 @@ use crate::{
         Result, StackMut, Word, derive_create_destination,
     },
     utils::WordExt,
-    version::GasId,
+    version::{GasId, StateGasSite},
 };
 use alloy_primitives::{Address, B256, Bytes};
 use core::{cmp::min, ops::Range};
@@ -124,7 +124,8 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         // EIP-8037: value transfer to a new account also charges state gas from
         // the reservoir. Charged before the 63/64 child gas split below.
         if features.contains(EvmFeatures::EIP8037) && transfers_value {
-            new_account_state_gas = state.gas_params().new_account_state_gas();
+            new_account_state_gas =
+                state_price(state, GasId::NewAccountState, StateGasSite::Account(to))?;
         }
     }
     gas.spend(cost)?;
@@ -455,7 +456,7 @@ pub fn create_with_state_charge<T: EvmTypesHost>(
     // pre-existing leaf pays nothing, so its child is not shortchanged by an unneeded spill. The
     // charge is refunded via `refill_reservoir` if the create fails to deploy (see the
     // create-failure path after `execute_message`).
-    let mut charged_create_state_gas = false;
+    let mut charged_create_state_gas = 0;
     if state.feature(EvmFeatures::EIP8037) {
         // `caller_info` is always `Some` when EIP-8037 is enabled.
         if let Some(caller_info) = caller_info.as_ref()
@@ -476,10 +477,10 @@ pub fn create_with_state_charge<T: EvmTypesHost>(
             .map_err(|error| state.fail(error))?
             .is_empty_for_new_account_gas
         {
-            let price = state.gas_params().create_state_gas();
-            before_state_charge(gas, state, destination, price)?;
-            gas.spend_state(price)?;
-            charged_create_state_gas = true;
+            charged_create_state_gas =
+                state_price(state, GasId::CreateState, StateGasSite::Account(destination))?;
+            before_state_charge(gas, state, destination, charged_create_state_gas)?;
+            gas.spend_state(charged_create_state_gas)?;
         }
     }
     // The state gas charged above spills into regular gas but stays out of the step cost.
@@ -523,8 +524,8 @@ pub fn create_with_state_charge<T: EvmTypesHost>(
     // created, so refund the charge to the reservoir via `refill_reservoir` (matching 0→x→0 storage
     // restoration). A successful deployment keeps the charge; an alive target was never charged.
     let create_failed = result.created_address.is_none() || !result.stop.is_success();
-    if charged_create_state_gas && create_failed {
-        gas.refill_reservoir(state.gas_params().create_state_gas());
+    if charged_create_state_gas != 0 && create_failed {
+        gas.refill_reservoir(charged_create_state_gas);
     }
     after(gas, state, &message, &result)?;
     // EIP-211 exposes CREATE failure data only for REVERT; other failures clear returndata.
@@ -557,13 +558,23 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
     // EIP-8037: sending balance to a new account via SELFDESTRUCT charges the
     // new-account state gas from the reservoir.
     if should_charge_topup && cx.state.feature(EvmFeatures::EIP8037) {
-        cx.gas.spend_state(cx.state.gas_params().new_account_state_gas())?;
+        let price = state_price(cx.state, GasId::NewAccountState, StateGasSite::Account(target))?;
+        cx.gas.spend_state(price)?;
     }
     if !res.previously_destroyed {
         cx.gas.record_refund(cx.state.gas_params().get(GasId::SelfdestructRefund) as i64);
     }
     cx.state.inspect_selfdestruct(destination, &target, &res.value);
     Err(InstrStop::SelfDestruct)
+}
+
+#[inline]
+fn state_price<T: EvmTypesHost>(
+    state: &mut InterpreterState<'_, '_, T>,
+    id: GasId,
+    site: StateGasSite,
+) -> Result<u64> {
+    T::state_gas_price(state.host(), id, site).map_err(|error| state.fail(error))
 }
 
 #[cfg(test)]

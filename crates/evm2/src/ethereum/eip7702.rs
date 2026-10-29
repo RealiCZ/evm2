@@ -11,7 +11,7 @@ use crate::{
     Evm, EvmFeatures, EvmTypes, TxResult, Version,
     env::TxEnvExt,
     evm::handler::{DefaultTxHandlerHooks, GasSettlement, TxHandlerHooks},
-    interpreter::{GasTracker, Host, InstrStop, MessageResult, gas::EIP8038_ACCOUNT_WRITE},
+    interpreter::{GasTracker, Host, MessageResult, gas::EIP8038_ACCOUNT_WRITE},
     registry::{HandlerError, HandlerResult, TxRequest},
     version::GasId,
 };
@@ -284,7 +284,12 @@ pub trait AuthAccounting {
     /// Called for an accepted authorization before its delegation is applied. Returning
     /// out-of-gas aborts the list: the delegation is not applied and no later authority is
     /// loaded.
-    fn accepted(&mut self, authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop>;
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError>;
 }
 
 /// EIP-2780 runtime accounting: meters the state-dependent charges on the transaction-level gas
@@ -350,10 +355,24 @@ impl<'g> RuntimeAuthCharges<'g> {
 impl AuthAccounting for RuntimeAuthCharges<'_> {
     fn rejected(&mut self) {}
 
-    fn accepted(&mut self, authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop> {
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        host: &mut Evm<'_, T>,
+        authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError> {
         // Non-existent authority: pay for the new account leaf's state bytes.
         if !auth.existed {
-            self.gas.spend_state(self.new_account_state_gas)?;
+            let price = if host.feature(EvmFeatures::EIP8037) {
+                T::state_gas_price(
+                    host,
+                    GasId::NewAccountState,
+                    crate::version::StateGasSite::Account(authority),
+                )?
+            } else {
+                self.new_account_state_gas
+            };
+            self.gas.spend_state(price)?;
         }
         // First write to the authority's leaf within the transaction pays `ACCOUNT_WRITE`.
         if !self.written.contains(&authority) {
@@ -366,7 +385,16 @@ impl AuthAccounting for RuntimeAuthCharges<'_> {
             && !auth.delegated_before_tx
             && !self.charged_delegation_bytes.contains(&authority)
         {
-            self.gas.spend_state(self.delegation_bytes_state_gas)?;
+            let price = if host.feature(EvmFeatures::EIP8037) {
+                T::state_gas_price(
+                    host,
+                    GasId::TxEip7702PerAuthState,
+                    crate::version::StateGasSite::Account(authority),
+                )?
+            } else {
+                self.delegation_bytes_state_gas
+            };
+            self.gas.spend_state(price)?;
             self.charged_delegation_bytes.push(authority);
         }
         Ok(())
@@ -419,7 +447,12 @@ impl AuthAccounting for AuthRefunds {
         }
     }
 
-    fn accepted(&mut self, _authority: Address, auth: &AppliedAuth) -> Result<(), InstrStop> {
+    fn accepted<T: EvmTypes>(
+        &mut self,
+        _host: &mut Evm<'_, T>,
+        _authority: Address,
+        auth: &AppliedAuth,
+    ) -> Result<(), crate::HostError> {
         // Existing authority: the worst-case `ACCOUNT_WRITE` execution gas was not needed. This
         // refund applies in every regime (it is the only authorization refund before EIP-8037).
         if auth.existed {
@@ -471,8 +504,10 @@ pub fn apply_auth_list<'a, T: EvmTypes, A: Eip7702Authorization>(
             accounting.rejected();
             continue;
         };
-        if accounting.accepted(authority, &auth).is_err() {
-            return Ok(true);
+        match accounting.accepted(host, authority, &auth) {
+            Ok(()) => {}
+            Err(crate::HostError::Halt(_)) => return Ok(true),
+            Err(crate::HostError::Execution(error)) => return Err(error.into()),
         }
         host.state.account(&authority)?.set_delegation(authorization.address());
     }

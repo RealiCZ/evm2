@@ -27,7 +27,7 @@ use crate::{
     },
     registry::{HandlerError, HandlerResult, TxRegistry, handler},
     utils::num_words,
-    version::GasId,
+    version::{GasId, StateGasSite},
 };
 use alloy_consensus::{
     EthereumTxEnvelope, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
@@ -584,7 +584,8 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             };
             let mut code_address = to;
             if host.feature(EvmFeatures::EIP2780) && !value.is_zero() && recipient_is_empty {
-                let new_account_state_gas = host.version().gas_params.new_account_state_gas();
+                let new_account_state_gas =
+                    T::state_gas_price(host, GasId::NewAccountState, StateGasSite::Account(to))?;
                 if tx_gas.spend_state(new_account_state_gas).is_err() {
                     return Ok(None);
                 }
@@ -647,7 +648,11 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                 let target_alive =
                     host.state.account(&destination)?.get().is_some_and(|info| !info.is_empty());
                 if !target_alive {
-                    let create_state_gas = host.version().gas_params.create_state_gas();
+                    let create_state_gas = T::state_gas_price(
+                        host,
+                        GasId::CreateState,
+                        StateGasSite::Account(destination),
+                    )?;
                     if tx_gas.spend_state(create_state_gas).is_err() {
                         return Ok(None);
                     }

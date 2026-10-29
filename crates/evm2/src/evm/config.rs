@@ -54,6 +54,20 @@ pub trait EvmTypesHost: Sized + 'static {
 
     /// Statically selected message lifecycle hooks; use `()` for the no-op policy.
     type MessageHooks: crate::MessageHooks<Self>;
+
+    /// Prices one state-gas schedule entry at the state location it creates or refills.
+    ///
+    /// Prices must be stable for a location throughout a transaction. Returning an execution
+    /// error aborts execution; callers must not turn a failed state lookup into an EVM halt.
+    #[inline]
+    fn state_gas_price(
+        host: &mut Self::Host<'_>,
+        id: crate::version::GasId,
+        site: crate::version::StateGasSite,
+    ) -> Result<u64, crate::ExecutionError> {
+        let _ = site;
+        Ok(host.execution_config().version().gas_params.get(id))
+    }
 }
 
 /// Runtime EVM type family whose host is [`Evm`] for every stored-object lifetime.

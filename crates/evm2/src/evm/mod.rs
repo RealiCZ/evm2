@@ -1619,9 +1619,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         let address = &message.destination;
         let mut stop = stop;
         if stop.is_success()
-            && let Err(failed) = self.validate_create_output(&mut gas, &mut output)
+            && let Err(error) = self.validate_create_output(address, &mut gas, &mut output)
         {
-            stop = failed;
+            stop = match error {
+                HostError::Halt(stop) => stop,
+                HostError::Execution(error) => return Err(error),
+            };
             output = Bytes::new();
         }
         self.hook_before_commit(message, &mut stop, &mut output, gas.tracker_mut())?;
@@ -1649,13 +1652,18 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         })
     }
 
-    fn validate_create_output(&self, gas: &mut Gas, output: &mut Bytes) -> Result<(), InstrStop> {
+    fn validate_create_output(
+        &mut self,
+        address: &Address,
+        gas: &mut Gas,
+        output: &mut Bytes,
+    ) -> Result<(), HostError> {
         if self.feature(EvmFeatures::CODE_SIZE_CHECK) && output.len() > self.version().max_code_size
         {
-            return Err(InstrStop::CreateContractSizeLimit);
+            return Err(InstrStop::CreateContractSizeLimit.into());
         }
         if self.feature(EvmFeatures::EIP3541) && output.first().is_some_and(|byte| *byte == 0xef) {
-            return Err(InstrStop::CreateContractStartingWithEF);
+            return Err(InstrStop::CreateContractStartingWithEF.into());
         }
 
         let code_deposit_gas = output
@@ -1666,7 +1674,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
             if self.feature(EvmFeatures::EIP2) {
                 // EIP-2 makes code-deposit OOG fail contract creation; Frontier instead
                 // creates the account with empty code.
-                return Err(InstrStop::OutOfGas);
+                return Err(InstrStop::OutOfGas.into());
             }
             *output = Bytes::new();
             return Ok(());
@@ -1680,7 +1688,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         if self.feature(EvmFeatures::EIP8037) {
             let params = &self.version().gas_params;
             gas.spend(params.keccak256_word_cost(output.len()))?;
-            let code_deposit_state_gas = params.code_deposit_state_gas(output.len());
+            let price = T::state_gas_price(
+                self,
+                GasId::CodeDepositState,
+                crate::version::StateGasSite::Account(*address),
+            )?;
+            let code_deposit_state_gas = price.saturating_mul(output.len() as u64);
             if code_deposit_state_gas > 0 {
                 gas.spend_state(code_deposit_state_gas)?;
             }
