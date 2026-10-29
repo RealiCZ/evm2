@@ -491,6 +491,7 @@ mod tests {
         type TxResultExt = ();
         type BlockEnvExt = ();
         type Host<'a> = TestHost;
+        type MessageHooks = ();
     }
 
     struct TestHost {

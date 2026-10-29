@@ -63,6 +63,7 @@ impl EvmTypesHost for CustomTypes {
     type TxResultExt = CustomTxResultExt;
     type BlockEnvExt = CustomBlockEnvExt;
     type Host<'a> = Evm<'a, Self>;
+    type MessageHooks = ();
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
