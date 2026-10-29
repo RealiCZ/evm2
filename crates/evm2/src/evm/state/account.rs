@@ -382,6 +382,22 @@ impl<'a, 'db> AccountHandle<'a, 'db> {
         self.tracked.present.as_ref()
     }
 
+    /// Returns the account information at the transaction boundary, before any frame mutated it.
+    ///
+    /// `None` means the account was absent. Loading bytecode into the present cache does not
+    /// change this baseline; committing and starting another transaction does.
+    #[inline]
+    pub const fn original(&self) -> Option<&AccountInfo> {
+        self.tracked.original.as_ref()
+    }
+
+    /// Returns whether existence or persisted account fields differ from the transaction baseline.
+    /// Storage-only writes and bytecode-cache fills do not count as account-info changes.
+    #[inline]
+    pub fn is_changed(&self) -> bool {
+        self.tracked.is_changed()
+    }
+
     /// Returns whether the account currently exists in the overlay.
     #[inline]
     pub const fn exists(&self) -> bool {
@@ -1018,5 +1034,48 @@ mod tests {
         }
         state.rollback(parent, features);
         assert_eq!(state.account(&address).unwrap().get(), Some(&original));
+    }
+
+    /// `original` is the account at the transaction boundary: a bytecode fill, a change and a
+    /// change taken back do not move it, a committed transaction does. `is_changed` compares it
+    /// with the present account and ignores storage-only writes.
+    #[test]
+    fn original_is_the_transaction_baseline() {
+        let (existing, absent) = (Address::repeat_byte(0x91), Address::repeat_byte(0x92));
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]));
+        let mut database = CacheDB::default();
+        database.insert_account_info(
+            &existing,
+            empty_account().with_balance(Word::from(5)).with_code(code),
+        );
+        let mut state = State::new(database);
+
+        let mut account = state.account(&existing).unwrap();
+        let before = account.original().cloned();
+        assert_eq!(before.as_ref().map(|info| info.balance), Some(Word::from(5)));
+        account.load_code().unwrap();
+        assert_eq!(account.original(), before.as_ref(), "a bytecode fill");
+        assert!(!account.is_changed());
+        account.set_balance(Word::from(6));
+        assert!(account.is_changed());
+        assert_eq!(account.original().map(|info| info.balance), Some(Word::from(5)));
+        account.set_balance(Word::from(5));
+        assert!(!account.is_changed(), "a change taken back");
+        drop(account);
+        state.storage_slot(&existing, Word::ONE).unwrap().set(Word::from(1));
+        assert!(!state.account(&existing).unwrap().is_changed(), "a storage-only write");
+
+        let mut account = state.account(&absent).unwrap();
+        assert!(account.original().is_none());
+        account.set_balance(Word::from(1));
+        assert!(account.original().is_none() && account.is_changed());
+        drop(account);
+
+        state.commit_transaction();
+        state.clear_transaction_state();
+        let account = state.account(&absent).unwrap();
+        let original = account.original().map(|info| info.balance);
+        assert_eq!(original, Some(Word::from(1)), "the next transaction's baseline");
+        assert!(!account.is_changed());
     }
 }
