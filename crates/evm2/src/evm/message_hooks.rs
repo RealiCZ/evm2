@@ -2,7 +2,7 @@
 
 use crate::{
     EvmTypesHost, ExecutionError,
-    interpreter::{GasTracker, InstrStop, Message, MessageResult},
+    interpreter::{Gas, GasTracker, InstrStop, Message, MessageResult},
 };
 use alloy_primitives::Bytes;
 
@@ -73,6 +73,27 @@ pub trait MessageHooks<T: EvmTypesHost>: 'static {
     ) -> Result<(), ExecutionError> {
         let _ = (evm, message, stop, output, gas);
         Ok(())
+    }
+
+    /// Admits validated code after deposit charges, before installation and `before_commit`.
+    ///
+    /// `None` accepts; `Some((stop, output))` rejects with a non-success stop. `Revert` restores
+    /// `gas_before` (including hashing and state charges); other stops retain the charged gas
+    /// until ordinary settlement. Extra charges can be made through `gas`. `gas_before` is the
+    /// frame's gas before the deposit charges. Execution errors abort the transaction.
+    ///
+    /// # Panics
+    ///
+    /// The caller panics if the returned rejection uses a success stop.
+    #[inline]
+    fn admit_code_deposit(
+        _host: &mut T::Host<'_>,
+        _message: &Message<T>,
+        _code: &Bytes,
+        _gas_before: &GasTracker,
+        _gas: &mut Gas,
+    ) -> Result<Option<(InstrStop, Bytes)>, ExecutionError> {
+        Ok(None)
     }
 
     /// Runs on built-in and consensus-synthetic results after settlement, before caller merge.

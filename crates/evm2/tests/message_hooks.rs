@@ -132,6 +132,21 @@ impl MessageHooks<Types> for Recorder {
         Ok(())
     }
 
+    fn admit_code_deposit(
+        _: &mut Evm<'_, Types>,
+        m: &Message<Types>,
+        _: &Bytes,
+        before: &GasTracker,
+        gas: &mut evm2::interpreter::Gas,
+    ) -> Result<Option<(InstrStop, Bytes)>, evm2::ExecutionError> {
+        if m.destination == Address::with_last_byte(0xa2) {
+            assert_eq!(before.remaining(), 292);
+            assert_eq!(gas.remaining(), 92);
+            return Ok(Some((InstrStop::Revert, Bytes::from_static(b"refused"))));
+        }
+        Ok(None)
+    }
+
     fn after(
         evm: &mut Evm<'_, Types>,
         m: &Message<Types>,
@@ -314,4 +329,29 @@ fn create_collision_reaches_before_commit_on_both_paths() {
         let code = evm.state_mut().account(&CODE).unwrap().load_code().unwrap();
         assert_eq!(code.original_byte_slice(), &[op::STOP], "the occupied account is untouched");
     }
+}
+
+fn deploy(evm: &mut Evm<'_, Types>, address: Address, gas: u64) -> MessageResult<Types> {
+    let mut message = Message::<Types> {
+        kind: MessageKind::Create,
+        destination: address,
+        call_target: address,
+        caller: PARENT,
+        gas_limit: gas,
+        code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::RETURN])),
+        ..Default::default()
+    };
+    Host::execute_message(evm, &mut message).unwrap()
+}
+
+#[test]
+fn code_admission_revert_restores_predeposit_gas_and_rolls_back_creation() {
+    let mut evm = evm();
+    let address = Address::with_last_byte(0xa2);
+    let result = deploy(&mut evm, address, 300);
+    assert_eq!(result.stop, InstrStop::Revert);
+    assert_eq!(result.output.as_ref(), b"refused");
+    assert_eq!(result.gas.remaining(), 292);
+    assert_eq!(result.created_address, None);
+    assert!(evm.state_mut().account(&address).unwrap().get().is_none());
 }
