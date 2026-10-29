@@ -33,6 +33,7 @@ impl EvmTypesHost for TestTypes {
     type TxResultExt = ();
     type BlockEnvExt = ();
     type Host<'a> = TestHost;
+    type MessageHooks = ();
 }
 
 #[derive(Debug)]

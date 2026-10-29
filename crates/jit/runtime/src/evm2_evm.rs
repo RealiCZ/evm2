@@ -979,6 +979,7 @@ mod custom_host_tests {
         type TxResultExt = ();
         type BlockEnvExt = [u64; 13];
         type Host<'a> = Evm<'a, Self>;
+        type MessageHooks = ();
     }
 
     #[test]
@@ -1179,6 +1180,7 @@ mod custom_host_tests {
         type TxResultExt = ();
         type BlockEnvExt = [u64; 13];
         type Host<'a> = Evm<'a, Self>;
+        type MessageHooks = ();
     }
 
     /// Runs `code` through the interpreter and the compiled runner on the same host type.
