@@ -11,7 +11,7 @@ use crate::{
 use alloy_eips::{eip4844::MAX_BLOBS_PER_BLOCK_DENCUN, eip7825::MAX_TX_GAS_LIMIT_OSAKA};
 
 mod gas_params;
-pub use gas_params::{GasId, GasParams};
+pub use gas_params::{GasId, GasParams, StateGasSite};
 
 mod features;
 pub use features::EvmFeatures;

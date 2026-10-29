@@ -36,6 +36,53 @@ impl EvmTypesHost for TestTypes {
     type MessageHooks = ();
 }
 
+/// A type family on [`crate::Evm`] that prices every state-gas charge at the schedule's entry
+/// times [`Prices::multiplier`] and records each priced `(entry, site)`; the entry in
+/// [`Prices::fail`] makes the hook return an execution error instead.
+pub(crate) struct PricedTypes;
+
+/// What [`PricedTypes`] prices with and saw.
+#[derive(Debug)]
+pub(crate) struct Prices {
+    pub(crate) seen: Vec<(crate::version::GasId, crate::version::StateGasSite)>,
+    pub(crate) multiplier: u64,
+    pub(crate) fail: Option<crate::version::GasId>,
+}
+
+impl Default for Prices {
+    fn default() -> Self {
+        Self { seen: Vec::new(), multiplier: 1, fail: None }
+    }
+}
+
+impl EvmTypesHost for PricedTypes {
+    type ConfigSelector = BaseEvmConfigSelector;
+    type SpecId = SpecId;
+    type Tx = TxEnvelope;
+    type EvmExt = Prices;
+    type MessageExt = ();
+    type MessageResultExt = ();
+    type TxEnvExt = ();
+    type TxResultExt = ();
+    type BlockEnvExt = ();
+    type Host<'a> = crate::Evm<'a, Self>;
+    type MessageHooks = ();
+
+    fn state_gas_price(
+        host: &mut crate::Evm<'_, Self>,
+        id: crate::version::GasId,
+        site: crate::version::StateGasSite,
+    ) -> Result<u64, crate::ExecutionError> {
+        let prices = host.ext_mut();
+        prices.seen.push((id, site));
+        if prices.fail == Some(id) {
+            return Err(crate::ExecutionError::Fatal("priced to fail".into()));
+        }
+        let multiplier = prices.multiplier;
+        Ok(host.version().gas_params.get(id).saturating_mul(multiplier))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TestHost {
     pub(crate) spec_id: SpecId,
