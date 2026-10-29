@@ -69,6 +69,11 @@ extern_table! {
         }
         if let Err(e) = pre_step::<T, C>(&mut remaining_gas, OP) {
             cold_path();
+            let cost = C::OPCODE_CONFIG.static_gas(OP) as u64;
+            state
+                .gas_mut()
+                .tracker_mut()
+                .record_failed_charge(remaining_gas.get().wrapping_add(cost), cost);
             state.set_result(Err(e));
             if M::INSPECT {
                 state.gas_mut().set_remaining(remaining_gas.get());
