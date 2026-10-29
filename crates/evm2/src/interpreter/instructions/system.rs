@@ -78,6 +78,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     transfers_value: bool,
     create_empty_account: bool,
     stack_gas_limit: u64,
+    before_state_charge: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, Address, u64) -> Result,
 ) -> Result<(u64, u64, Bytecode, Address)> {
     if transfers_value {
         gas.spend(state.gas_params().get(GasId::TransferValueCost))?;
@@ -127,6 +128,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         }
     }
     gas.spend(cost)?;
+    before_state_charge(gas, state, to, new_account_state_gas)?;
     gas.spend_state(new_account_state_gas)?;
 
     let mut gas_limit = if state.feature(EvmFeatures::EIP150) {
@@ -152,6 +154,7 @@ fn prepare_call<T: EvmTypesHost>(
     kind: MessageKind,
     message: &mut Message<T>,
     return_memory_range: &mut Range<usize>,
+    before_state_charge: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, Address, u64) -> Result,
 ) -> Result<u64> {
     let has_value = match kind {
         MessageKind::Call | MessageKind::CallCode => true,
@@ -184,6 +187,7 @@ fn prepare_call<T: EvmTypesHost>(
             has_transfer,
             kind == MessageKind::Call,
             local_gas_limit,
+            before_state_charge,
         )?;
     let input = memory_range_bytes(state, input_range)?;
 
@@ -252,7 +256,7 @@ fn call_inner<T: EvmTypesHost>(
 /// part of the step cost reported to inspectors.
 #[inline]
 pub fn call_with<T: EvmTypesHost>(
-    mut stack: StackMut<'_>,
+    stack: StackMut<'_>,
     gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
     kind: MessageKind,
@@ -264,10 +268,32 @@ pub fn call_with<T: EvmTypesHost>(
         &MessageResult<T>,
     ) -> Result,
 ) -> Result {
+    call_with_state_charge(stack, gas, state, kind, |_, _, _, _| Ok(()), before, after)
+}
+
+/// Like [`call_with`], with a hook before the opcode's state-gas debit.
+///
+/// The hook receives the destination and captured price, before forwarding gas.
+/// It may adjust funding or refuse execution, but must not pay the debit itself.
+#[inline]
+pub fn call_with_state_charge<T: EvmTypesHost>(
+    mut stack: StackMut<'_>,
+    gas: &mut Gas,
+    state: &mut InterpreterState<'_, '_, T>,
+    kind: MessageKind,
+    before_state_charge: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, Address, u64) -> Result,
+    before: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, &mut Message<T>) -> Result,
+    after: impl FnOnce(
+        &mut Gas,
+        &mut InterpreterState<'_, '_, T>,
+        &Message<T>,
+        &MessageResult<T>,
+    ) -> Result,
+) -> Result {
     let mut message = Message::<T>::default();
     let mut return_memory_range = 0..0;
     let new_account_state_gas =
-        prepare_call(stack.reborrow(), gas, state, kind, &mut message, &mut return_memory_range)?;
+        prepare_call(stack.reborrow(), gas, state, kind, &mut message, &mut return_memory_range, before_state_charge)?;
     before(gas, state, &mut message)?;
 
     let mut result =
@@ -345,10 +371,32 @@ fn create_inner<T: EvmTypesHost>(
 /// Both hooks may charge or credit `gas` or fail the instruction, as in [`call_with`].
 #[inline]
 pub fn create_with<T: EvmTypesHost>(
+    stack: StackMut<'_>,
+    gas: &mut Gas,
+    state: &mut InterpreterState<'_, '_, T>,
+    is_create2: bool,
+    before: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, &mut Message<T>) -> Result,
+    after: impl FnOnce(
+        &mut Gas,
+        &mut InterpreterState<'_, '_, T>,
+        &Message<T>,
+        &MessageResult<T>,
+    ) -> Result,
+) -> Result {
+    create_with_state_charge(stack, gas, state, is_create2, |_, _, _, _| Ok(()), before, after)
+}
+
+/// Like [`create_with`], with a hook before the opcode's state-gas debit.
+///
+/// The hook receives the destination and captured price, before forwarding gas.
+/// It may adjust funding or refuse execution, but must not pay the debit itself.
+#[inline]
+pub fn create_with_state_charge<T: EvmTypesHost>(
     mut stack: StackMut<'_>,
     gas: &mut Gas,
     state: &mut InterpreterState<'_, '_, T>,
     is_create2: bool,
+    before_state_charge: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, Address, u64) -> Result,
     before: impl FnOnce(&mut Gas, &mut InterpreterState<'_, '_, T>, &mut Message<T>) -> Result,
     after: impl FnOnce(
         &mut Gas,
@@ -428,7 +476,9 @@ pub fn create_with<T: EvmTypesHost>(
             .map_err(|error| state.fail(error))?
             .is_empty_for_new_account_gas
         {
-            gas.spend_state(state.gas_params().create_state_gas())?;
+            let price = state.gas_params().create_state_gas();
+            before_state_charge(gas, state, destination, price)?;
+            gas.spend_state(price)?;
             charged_create_state_gas = true;
         }
     }
@@ -1274,5 +1324,99 @@ mod tests {
         assert_eq!(hooked.stack(), [Word::ZERO]);
         assert!(host.calls.is_empty());
         assert_eq!(hooked.gas_remaining(), base.gas_remaining());
+    }
+    #[test]
+    fn state_charge_hook_can_stop_call_before_spill_or_child() {
+        let mut host = TestHost { is_empty: true, ..Default::default() };
+        host.execution_config = crate::ExecutionConfig::for_base_spec::<crate::BaseEvmConfigSelector>(
+            SpecId::AMSTERDAM,
+        );
+        let message = Message::<crate::test_utils::TestTypes>::default();
+        let mut interp =
+            crate::interpreter::Interpreter::<crate::test_utils::TestTypes>::new(&message);
+        interp.prepare_run(&mut host);
+        let state = InterpreterState::wrap_mut(&mut interp);
+        let mut backing = crate::interpreter::StackBacking(
+            [core::mem::MaybeUninit::uninit(); crate::constants::STACK_LIMIT],
+        );
+        let mut len = 0;
+        let mut stack = StackMut::new(&mut backing, &mut len);
+        for word in [0, 0, 0, 0, 1, 0xee, 1000] {
+            stack.push(Word::from(word)).unwrap();
+        }
+        let mut gas = Gas::new(20_000);
+        let result = call_with_state_charge(
+            stack,
+            &mut gas,
+            state,
+            MessageKind::Call,
+            |gas, _, address, cost| {
+                assert_eq!(address, Address::with_last_byte(0xee));
+                assert!(cost > gas.remaining());
+                assert_eq!(gas.state_gas_spent(), 0);
+                Err(InstrStop::Revert)
+            },
+            |_, _, _| panic!("child must not be prepared after admission failed"),
+            |_, _, _, _| panic!("no child to settle"),
+        );
+        assert_eq!(result, Err(InstrStop::Revert));
+        assert_eq!(gas.state_gas_spent(), 0);
+        assert_eq!(gas.state_gas_spilled(), 0);
+        assert!(host.calls.is_empty());
+    }
+
+    #[test]
+    fn state_charge_hook_can_fund_create_before_spill_and_forward() {
+        let mut host = TestHost { is_empty: true, ..Default::default() };
+        host.execution_config = crate::ExecutionConfig::for_base_spec::<crate::BaseEvmConfigSelector>(
+            SpecId::AMSTERDAM,
+        );
+        let message = Message::<crate::test_utils::TestTypes> {
+            destination: Address::with_last_byte(0xaa),
+            ..Default::default()
+        };
+        let expected_address = message.destination.create(0);
+        let mut interp =
+            crate::interpreter::Interpreter::<crate::test_utils::TestTypes>::new(&message);
+        interp.prepare_run(&mut host);
+        let state = InterpreterState::wrap_mut(&mut interp);
+        let mut backing = crate::interpreter::StackBacking(
+            [core::mem::MaybeUninit::uninit(); crate::constants::STACK_LIMIT],
+        );
+        let mut len = 0;
+        let mut stack = StackMut::new(&mut backing, &mut len);
+        for _ in 0..3 {
+            stack.push(Word::ZERO).unwrap();
+        }
+        let mut gas = Gas::new(20_000);
+        let price = core::cell::Cell::new(0);
+        let result = create_with_state_charge(
+            stack,
+            &mut gas,
+            state,
+            false,
+            |gas, _, address, cost| {
+                assert_eq!(address, expected_address);
+                assert!(cost > gas.remaining());
+                assert_eq!(gas.state_gas_spent(), 0);
+                gas.set_reservoir(cost);
+                price.set(cost);
+                Ok(())
+            },
+            |gas, _, _| {
+                assert_eq!(gas.state_gas_spent(), price.get() as i64);
+                assert_eq!(gas.state_gas_spilled(), 0);
+                Ok(())
+            },
+            |gas, _, _, _| {
+                // TestHost returns no created address, so the captured price is refunded.
+                assert_eq!(gas.state_gas_spent(), 0);
+                assert_eq!(gas.reservoir(), price.get());
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(host.calls.len(), 1);
+        assert_eq!(host.calls[0].destination, expected_address);
     }
 }

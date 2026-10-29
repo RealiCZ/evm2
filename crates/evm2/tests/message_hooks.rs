@@ -92,7 +92,6 @@ impl MessageHooks<Types> for Recorder {
 
     fn before(
         evm: &mut Evm<'_, Types>,
-        _: &TxEnvExt<()>,
         m: &mut Message<Types>,
     ) -> Result<Option<MessageResult<Types>>, evm2::ExecutionError> {
         evm.ext_mut().push(format!("before {}", m.call_target));
