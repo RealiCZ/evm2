@@ -154,6 +154,9 @@ pub struct GasTracker {
     /// parent frame so a later parent rollback can return it.
     state_gas_spilled: u64,
     refunded: i64,
+    /// The last execution-gas charge that failed: the remaining gas before it and its cost
+    /// (`cost == 0`: none). Written only on the failure side of a charge.
+    failed_charge: [u64; 2],
 }
 
 impl GasTracker {
@@ -185,6 +188,7 @@ impl GasTracker {
             state_gas_spent: 0,
             state_gas_spilled: 0,
             refunded: 0,
+            failed_charge: [0; 2],
         }
     }
 
@@ -325,6 +329,7 @@ impl GasTracker {
         self.remaining = remaining.wrapping_sub(cost);
         if remaining < cost {
             cold_path();
+            self.record_failed_charge(remaining, cost);
             Err(InstrStop::OutOfGas)
         } else {
             Ok(())
@@ -484,6 +489,33 @@ impl GasTracker {
     #[inline]
     pub const fn spend_all(&mut self) {
         self.remaining = 0;
+    }
+
+    /// Returns the last failed execution-gas charge as `(remaining_before, cost)`.
+    ///
+    /// Recorded on the failure side of every execution-gas charge ([`Self::spend`], which every
+    /// instruction body and memory expansion use, and the dispatcher's static gas), on both
+    /// plain and inspected paths, before wrapping or inspector normalization zeroes `remaining`.
+    /// This is one debit, not the whole opcode's cost. It does not change tracer step costs.
+    /// Successful charges and gas settlement preserve the record; child records are not merged.
+    /// `try_spend`/`try_spend_state` failures leave the entire tracker unchanged. Prechecks such
+    /// as skipped cold loads and the SSTORE sentry do not attempt a debit and record nothing.
+    #[inline]
+    pub const fn failed_charge(&self) -> Option<(u64, u64)> {
+        let [remaining, cost] = self.failed_charge;
+        if cost == 0 { None } else { Some((remaining, cost)) }
+    }
+
+    /// Clears the failed-charge record.
+    #[inline]
+    pub const fn clear_failed_charge(&mut self) {
+        self.failed_charge = [0; 2];
+    }
+
+    /// Records a failed execution-gas charge of `cost` with `remaining` gas left before it.
+    #[inline(always)]
+    pub const fn record_failed_charge(&mut self, remaining: u64, cost: u64) {
+        self.failed_charge = [remaining, cost];
     }
 }
 
@@ -774,6 +806,33 @@ impl MemoryGas {
 mod tests {
     use super::*;
     use core::assert_matches;
+
+    #[test]
+    fn test_failed_charge_record() {
+        let mut gas = GasTracker::new(100);
+        assert_eq!(gas.failed_charge(), None);
+        assert!(gas.spend(40).is_ok());
+        assert_eq!(gas.failed_charge(), None, "a charge that succeeds records nothing");
+        assert_matches!(gas.spend(70), Err(InstrStop::OutOfGas));
+        assert_eq!(gas.failed_charge(), Some((60, 70)), "remaining before the charge, its cost");
+        gas.set_remaining(0);
+        assert_eq!(gas.failed_charge(), Some((60, 70)), "a setter keeps the record");
+        assert_matches!(gas.spend(5), Err(InstrStop::OutOfGas));
+        assert_eq!(gas.failed_charge(), Some((0, 5)), "a later failure replaces it");
+        gas.clear_failed_charge();
+        assert_eq!(gas.failed_charge(), None);
+    }
+
+    #[test]
+    fn non_destructive_probes_preserve_existing_failure_record() {
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(10, 5);
+        gas.record_failed_charge(8, 20);
+        let before = gas;
+        assert_eq!(gas.try_spend(11), Err(InstrStop::OutOfGas));
+        assert_eq!(gas, before);
+        assert_eq!(gas.try_spend_state(16), Err(InstrStop::OutOfGas));
+        assert_eq!(gas, before);
+    }
 
     #[test]
     fn test_new_used_gas_saturates_remaining() {
