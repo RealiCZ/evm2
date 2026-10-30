@@ -113,6 +113,10 @@ pub struct CacheDB<ExtDB = EmptyDB> {
     /// Optional EIP-7928 Block Access List read/build state. Default is empty (no BAL attached and
     /// no builder), in which case reads go straight to the cache/database.
     pub bal_context: BalContext,
+    /// Reads uncached storage of an account the backing database reports as absent from the
+    /// backing database, as revm does, instead of answering zero without a read. Read sets
+    /// (stateless witnesses) then match revm's; values are the same for a consistent database.
+    pub read_absent_storage: bool,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     pub _non_exhaustive: (),
 }
@@ -128,7 +132,7 @@ impl<ExtDB> CacheDB<ExtDB> {
     /// Creates a new cache over a backing database.
     #[inline]
     pub fn new(db: ExtDB) -> Self {
-        Self { cache: Cache::default(), db, bal_context: BalContext::new(), _non_exhaustive: () }
+        Self { cache: Cache::default(), db, bal_context: BalContext::new(), read_absent_storage: false, _non_exhaustive: () }
     }
 
     /// Applies borrowed state changes to this cache.
@@ -400,7 +404,7 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                         if storage.wiped {
                             return Ok(Word::ZERO);
                         }
-                        if self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                        if !self.read_absent_storage && self.cache.accounts.get(address).is_some_and(Option::is_none) {
                             return Ok(Word::ZERO);
                         }
                         let value = self.db.get_storage(address, key)?;
@@ -409,7 +413,7 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                 }
             }
             Entry::Vacant(entry) => {
-                if self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                if !self.read_absent_storage && self.cache.accounts.get(address).is_some_and(Option::is_none) {
                     return Ok(Word::ZERO);
                 }
                 let value = self.db.get_storage(address, key)?;

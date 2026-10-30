@@ -88,6 +88,7 @@ impl StateSnapshot {
                     cache: self.cache,
                     db: boxed_dyn_database(db),
                     bal_context: self.bal_context,
+                    read_absent_storage: false,
                     _non_exhaustive: (),
                 },
                 prewarm_set: self.prewarm_set,
@@ -137,6 +138,7 @@ impl State<'_> {
             cache: self.database.cache.clone(),
             db: boxed_dyn_database(db),
             bal_context: self.database.bal_context.clone(),
+            read_absent_storage: self.database.read_absent_storage,
             _non_exhaustive: (),
         };
         database.commit(&self.accounts);
@@ -457,6 +459,12 @@ impl<'a> State<'a> {
         if let Some(account) = self.accounts.get_mut(address) {
             account.flags.set(AccountFlags::WARM, warm);
         }
+    }
+
+    /// Reads uncached storage of an account the backing database reports as absent from the
+    /// backing database, as revm does ([`CacheDB::read_absent_storage`]).
+    pub fn set_read_absent_storage(&mut self, read: bool) {
+        self.inner.database.read_absent_storage = read;
     }
 
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
