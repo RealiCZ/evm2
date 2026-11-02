@@ -5,7 +5,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use evm2::{
     BaseEvmConfigSelector, Evm, EvmTypesHost, MessageHooks, NoopInspector, SpecId,
     bytecode::Bytecode,
-    env::{BlockEnv, TxEnvExt},
+    env::BlockEnv,
     evm::{AccountInfo, InMemoryDB},
     interpreter::{
         GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, MessageResult, op,
@@ -188,7 +188,7 @@ fn run(inspect: bool) -> (Vec<String>, [U256; 3], U256, U256) {
         code_address: PARENT,
         ..MessageExt::default()
     };
-    let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+    let result = Host::execute_message(&mut evm, &mut message).unwrap();
     assert_eq!(result.stop, InstrStop::Stop);
     let slots = [1u64, 2, 3]
         .map(|k| evm.state_mut().storage_slot_untracked(&PARENT, &U256::from(k)).unwrap());
@@ -242,7 +242,7 @@ fn inspector_answers_pair_observers_without_running_consensus_hooks() {
     let mut evm = evm();
     evm.set_inspector(Answer);
     let mut message = Message::<Types>::default();
-    Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+    Host::execute_message(&mut evm, &mut message).unwrap();
     assert_eq!(
         evm.ext(),
         &[format!("enter {}", Address::ZERO), format!("exit {} true", Address::ZERO),]
@@ -254,7 +254,7 @@ fn hook_errors_roll_back_state_and_pair_observers() {
     let mut evm = evm();
     let target = Address::with_last_byte(0xfe);
     let mut message = Message::<Types> { call_target: target, ..Default::default() };
-    let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message);
+    let result = Host::execute_message(&mut evm, &mut message);
     assert!(matches!(result, Err(evm2::ExecutionError::Fatal(_))));
     assert_eq!(evm.state_mut().account(&PARENT).unwrap().get().unwrap().nonce, 0);
     assert_eq!(
@@ -273,7 +273,7 @@ fn deploy(evm: &mut Evm<'_, Types>, address: Address, gas: u64) -> MessageResult
         code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::RETURN])),
         ..Default::default()
     };
-    Host::execute_message(evm, &TxEnvExt::default(), &mut message).unwrap()
+    Host::execute_message(evm, &mut message).unwrap()
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn failed_static_debit_survives_inspector_zeroing_without_changing_settlement() 
             code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 0])),
             ..Default::default()
         };
-        let result = Host::execute_message(&mut evm, &TxEnvExt::default(), &mut message).unwrap();
+        let result = Host::execute_message(&mut evm, &mut message).unwrap();
         assert_eq!(result.stop, InstrStop::OutOfGas, "inspected={inspected}");
         assert_eq!(result.gas.remaining(), 0);
         assert_eq!(result.gas.failed_charge(), Some((2, 3)));

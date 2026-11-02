@@ -132,7 +132,13 @@ impl<ExtDB> CacheDB<ExtDB> {
     /// Creates a new cache over a backing database.
     #[inline]
     pub fn new(db: ExtDB) -> Self {
-        Self { cache: Cache::default(), db, bal_context: BalContext::new(), read_absent_storage: false, _non_exhaustive: () }
+        Self {
+            cache: Cache::default(),
+            db,
+            bal_context: BalContext::new(),
+            read_absent_storage: false,
+            _non_exhaustive: (),
+        }
     }
 
     /// Applies borrowed state changes to this cache.
@@ -404,7 +410,9 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                         if storage.wiped {
                             return Ok(Word::ZERO);
                         }
-                        if !self.read_absent_storage && self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                        if !self.read_absent_storage
+                            && self.cache.accounts.get(address).is_some_and(Option::is_none)
+                        {
                             return Ok(Word::ZERO);
                         }
                         let value = self.db.get_storage(address, key)?;
@@ -413,7 +421,9 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                 }
             }
             Entry::Vacant(entry) => {
-                if !self.read_absent_storage && self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                if !self.read_absent_storage
+                    && self.cache.accounts.get(address).is_some_and(Option::is_none)
+                {
                     return Ok(Word::ZERO);
                 }
                 let value = self.db.get_storage(address, key)?;

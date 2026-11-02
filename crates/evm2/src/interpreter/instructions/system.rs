@@ -293,8 +293,15 @@ pub fn call_with_state_charge<T: EvmTypesHost>(
 ) -> Result {
     let mut message = Message::<T>::default();
     let mut return_memory_range = 0..0;
-    let new_account_state_gas =
-        prepare_call(stack.reborrow(), gas, state, kind, &mut message, &mut return_memory_range, before_state_charge)?;
+    let new_account_state_gas = prepare_call(
+        stack.reborrow(),
+        gas,
+        state,
+        kind,
+        &mut message,
+        &mut return_memory_range,
+        before_state_charge,
+    )?;
     before(gas, state, &mut message)?;
 
     let mut result =

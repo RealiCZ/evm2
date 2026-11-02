@@ -4,7 +4,7 @@ use alloy_primitives::{Address, Bytes, U256};
 use evm2::{
     BaseEvmTypes, Evm, Precompiles, SpecId,
     bytecode::Bytecode,
-    env::BlockEnvExt,
+    env::{BlockEnvExt, TxEnvExt},
     evm::{AccountInfo, InMemoryDB, precompile::PrecompileOutput},
     interpreter::{GasTracker, Host, InstrStop, Message, MessageExt, MessageKind, Word, op},
     precompiles::{Precompile, PrecompileError, PrecompileHalt, PrecompileId, PrecompileResult},

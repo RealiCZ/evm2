@@ -463,7 +463,7 @@ impl<'a> State<'a> {
 
     /// Reads uncached storage of an account the backing database reports as absent from the
     /// backing database, as revm does ([`CacheDB::read_absent_storage`]).
-    pub fn set_read_absent_storage(&mut self, read: bool) {
+    pub const fn set_read_absent_storage(&mut self, read: bool) {
         self.inner.database.read_absent_storage = read;
     }
 

@@ -1394,11 +1394,8 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let answer = T::MessageHooks::before(self, message)?;
-        let mut result = if let Some(answer) = answer {
-            answer
-        } else {
-            self.dispatch_message(message)?
-        };
+        let mut result =
+            if let Some(answer) = answer { answer } else { self.dispatch_message(message)? };
         // Settle the returning frame's gas for its stop reason at this single exit,
         // rather than in each result builder, so every consumer (parent
         // `merge_child_gas`, top-level accounting, inspectors) reads the settled gas.
@@ -1414,9 +1411,7 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         message: &mut Message<T>,
     ) -> Result<MessageResult<T>, ExecutionError> {
         let result = match message.kind {
-            MessageKind::Create | MessageKind::Create2 => {
-                self.execute_create_message(message)
-            }
+            MessageKind::Create | MessageKind::Create2 => self.execute_create_message(message),
             MessageKind::Call
             | MessageKind::CallCode
             | MessageKind::DelegateCall
@@ -2284,7 +2279,7 @@ mod tests {
     use crate::{
         BaseEvmConfigSelector, BaseEvmTypes, NoopInspector, Precompiles, SpecId, Version,
         bytecode::Bytecode,
-        env::BlockEnvExt,
+        env::{BlockEnvExt, TxEnvExt},
         ethereum::{RecoveredTxEnvelope, TxEnvelope, ethereum_tx_registry},
         interpreter::{GasTracker, Interpreter, Message, MessageExt, MessageKind, op},
         precompiles::{Precompile, PrecompileError, PrecompileId, PrecompileMap},
@@ -2908,8 +2903,7 @@ mod tests {
             precompiles,
         );
         let message = precompile_message(TEST_PRECOMPILE);
-        let _ =
-            evm.execute_precompile(&message, &mut GasTracker::new(30_000));
+        let _ = evm.execute_precompile(&message, &mut GasTracker::new(30_000));
     }
 
     #[test]
@@ -3043,8 +3037,7 @@ mod tests {
         );
         let message = precompile_message(TEST_PRECOMPILE);
 
-        evm.execute_precompile(&message, &mut GasTracker::new(30_000))
-            .unwrap();
+        evm.execute_precompile(&message, &mut GasTracker::new(30_000)).unwrap();
     }
 
     #[test]
@@ -3504,10 +3497,7 @@ mod tests {
         bytecode_message.input = Bytes::from_static(&[0x01]);
         assert!(evm.contains_precompile(&bytecode_message));
         let output = evm
-            .execute_precompile(
-                &precompile_message(TEST_PRECOMPILE),
-                &mut GasTracker::new(30_000),
-            )
+            .execute_precompile(&precompile_message(TEST_PRECOMPILE), &mut GasTracker::new(30_000))
             .unwrap();
         assert_eq!(output.bytes(), b"inner");
         assert_eq!(
@@ -3570,8 +3560,7 @@ mod tests {
         assert!(evm.precompile_tx_env().is_none());
         *evm.tx_env_mut() = tx_env;
         let output =
-            Host::execute_message(&mut evm, &mut precompile_message(TEST_PRECOMPILE))
-                .unwrap();
+            Host::execute_message(&mut evm, &mut precompile_message(TEST_PRECOMPILE)).unwrap();
         assert_eq!(output.output, Bytes::from_static(b"context"));
         assert!(evm.precompile_tx_env().is_none());
     }
@@ -3605,8 +3594,7 @@ mod tests {
             );
             let tx_env = TxEnvExt { origin: Address::with_last_byte(0x77), ..TxEnvExt::default() };
             *evm.tx_env_mut() = tx_env;
-            let result =
-                Host::execute_message(&mut evm, &mut precompile_message(TEST_PRECOMPILE));
+            let result = Host::execute_message(&mut evm, &mut precompile_message(TEST_PRECOMPILE));
             assert_eq!(result.is_err(), fatal);
             assert!(evm.precompile_tx_env().is_none());
             assert!(!evm.running);
@@ -3627,10 +3615,7 @@ mod tests {
             })]),
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Host::execute_message(
-                &mut evm,
-                &mut precompile_message(TEST_PRECOMPILE),
-            );
+            let _ = Host::execute_message(&mut evm, &mut precompile_message(TEST_PRECOMPILE));
         }));
         assert!(result.is_err());
         assert!(evm.precompile_tx_env().is_none());
