@@ -1743,4 +1743,44 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn tx_total_gas_cap_default_rejects_two_pow_32() {
+        let amsterdam = Version::base(SpecId::AMSTERDAM);
+        let gas_limit = 1u64 << 32;
+
+        assert!(amsterdam.feature(EvmFeatures::EIP8037));
+        assert_eq!(
+            validate_tx_gas_limit_cap(amsterdam, gas_limit),
+            Err(HandlerError::TxGasLimitGreaterThanCap {
+                gas_limit,
+                cap: MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM,
+            })
+        );
+    }
+
+    #[test]
+    fn tx_total_gas_cap_disabled_allows_two_pow_32() {
+        let mut amsterdam = Version::new(SpecId::AMSTERDAM);
+        amsterdam.tx_total_gas_cap = u64::MAX;
+        let gas_limit = 1u64 << 32;
+
+        assert!(amsterdam.feature(EvmFeatures::EIP8037));
+        assert_eq!(validate_tx_gas_limit_cap(&amsterdam, gas_limit), Ok(()));
+        assert_eq!(validate_tx_gas_limit_cap(&amsterdam, u64::MAX), Ok(()));
+    }
+
+    #[test]
+    fn tx_total_gas_cap_custom_value_is_enforced() {
+        let mut amsterdam = Version::new(SpecId::AMSTERDAM);
+        let cap = 50_000_000;
+        amsterdam.tx_total_gas_cap = cap;
+
+        assert!(amsterdam.feature(EvmFeatures::EIP8037));
+        assert_eq!(validate_tx_gas_limit_cap(&amsterdam, cap), Ok(()));
+        assert_eq!(
+            validate_tx_gas_limit_cap(&amsterdam, cap + 1),
+            Err(HandlerError::TxGasLimitGreaterThanCap { gas_limit: cap + 1, cap })
+        );
+    }
 }
