@@ -37,6 +37,12 @@ pub struct Version {
     pub chain_id: u64,
     /// Transaction gas limit cap.
     pub tx_gas_limit_cap: u64,
+    /// EIP-8037 total transaction gas limit cap.
+    ///
+    /// Bounds `tx.gas` when [`EvmFeatures::EIP8037`] is active. `u64::MAX` disables the cap. The
+    /// default is [`MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM`] (`2^32 - 1`). Without EIP-8037 this field
+    /// is unused and [`tx_gas_limit_cap`](Self::tx_gas_limit_cap) bounds `tx.gas` instead.
+    pub tx_total_gas_cap: u64,
     /// Hard memory limit in bytes.
     ///
     /// Frame output ranges are `u32`, so
@@ -89,7 +95,8 @@ impl Version {
     /// Without EIP-8037, [`tx_gas_limit_cap`](Self::tx_gas_limit_cap) (EIP-7825) bounds `tx.gas`
     /// itself, which also bounds the execution gas. With EIP-8037, `tx.gas` may exceed it because
     /// the excess funds the state-gas reservoir, so it only bounds the required execution gas, and
-    /// `tx.gas` is bounded by [`MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM`] instead.
+    /// `tx.gas` is bounded by [`tx_total_gas_cap`](Self::tx_total_gas_cap). `u64::MAX` disables
+    /// that total cap; the default is [`MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM`].
     ///
     /// The Ethereum transaction handlers enforce these caps through
     /// [`validate_tx_gas_limit_cap`](crate::ethereum::validate_tx_gas_limit_cap) and
@@ -99,7 +106,7 @@ impl Version {
     #[inline]
     pub const fn tx_gas_caps(&self) -> (u64, u64) {
         if self.feature(EvmFeatures::EIP8037) {
-            (MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM, self.tx_gas_limit_cap)
+            (self.tx_total_gas_cap, self.tx_gas_limit_cap)
         } else {
             (self.tx_gas_limit_cap, u64::MAX)
         }
@@ -168,6 +175,7 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             features: EvmFeatures::empty(),
             chain_id: DEFAULT_CHAIN_ID,
             tx_gas_limit_cap: u64::MAX,
+            tx_total_gas_cap: MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM,
             memory_limit: DEFAULT_MEMORY_LIMIT,
             max_code_size: MAX_CODE_SIZE,
             max_initcode_size: MAX_INITCODE_SIZE,
@@ -184,6 +192,7 @@ static BASE_VERSIONS: [Version; SpecId::COUNT] = {
             features: base_features(spec_id),
             chain_id: DEFAULT_CHAIN_ID,
             tx_gas_limit_cap: base_tx_gas_limit_cap(spec_id),
+            tx_total_gas_cap: MAX_TX_TOTAL_GAS_LIMIT_AMSTERDAM,
             memory_limit: DEFAULT_MEMORY_LIMIT,
             max_code_size: base_max_code_size(spec_id),
             max_initcode_size: base_max_initcode_size(spec_id),
