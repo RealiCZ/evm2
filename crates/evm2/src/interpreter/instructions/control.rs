@@ -48,7 +48,7 @@ pub fn pc(cx: _) -> out {
 
 #[instruction(dynamic_gas)]
 pub fn gas(cx: _) -> out {
-    out.write_u64(cx.gas.remaining());
+    out.write_u64(super::gas_budget(cx.gas, cx.state, super::BudgetUse::Gas));
 }
 
 #[instruction]

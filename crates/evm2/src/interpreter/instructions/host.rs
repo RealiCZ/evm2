@@ -17,8 +17,9 @@ pub fn sload(cx: _, [key]: [Word]) -> Result<out> {
     // charges the additional cold cost when the slot was not already warm. Avoid
     // touching the host/database if the frame cannot afford that cold surcharge.
     let additional_cold_cost = cx.state.gas_params().get(GasId::ColdStorageAdditionalCost);
-    let skip_cold_load =
-        cx.state.feature(EvmFeatures::EIP2929) && cx.gas.remaining() < additional_cold_cost;
+    let skip_cold_load = cx.state.feature(EvmFeatures::EIP2929)
+        && super::gas_budget(cx.gas, cx.state, super::BudgetUse::ColdStorage)
+            < additional_cold_cost;
     let destination = &cx.state.message().destination;
     let load = cx
         .state
@@ -59,7 +60,10 @@ pub fn sstore_with<T: EvmTypesHost>(
 
     // EIP-2200: SSTORE may not execute with only the value-transfer stipend left. This
     // check happens before any gas is charged or host storage is touched.
-    if is_eip2200 && gas.remaining() <= state.gas_params().get(GasId::CallStipend) {
+    if is_eip2200
+        && super::gas_budget(gas, state, super::BudgetUse::SstoreSentry)
+            <= state.gas_params().get(GasId::CallStipend)
+    {
         return Err(InstrStop::ReentrancySentryOOG);
     }
 
@@ -72,7 +76,8 @@ pub fn sstore_with<T: EvmTypesHost>(
     // additional cold-load charge. The host performs the write and returns
     // original/present/new values for net metering.
     let skip_cold_load = state.feature(EvmFeatures::EIP2929)
-        && gas.remaining() < state.gas_params().get(GasId::ColdStorageAdditionalCost);
+        && super::gas_budget(gas, state, super::BudgetUse::ColdStorage)
+            < state.gas_params().get(GasId::ColdStorageAdditionalCost);
     let destination = &state.message().destination;
     let state_load = state
         .host()
@@ -96,7 +101,7 @@ pub fn sstore_with<T: EvmTypesHost>(
                 StateGasSite::Storage(*destination, *key),
             )
             .map_err(|e| state.fail(e))?;
-            gas.spend_state(price)?;
+            super::spend_state_reserve_first(gas, state, GasId::SstoreSetState, price)?;
         }
 
         // EIP-8037: a 0→x→0 storage restoration returns the state gas charged for

@@ -13,7 +13,8 @@ fn load_account<T: EvmTypesHost>(
     load_code: bool,
 ) -> Result<AccountLoad> {
     let cold_load_gas = cx.state.gas_params().cold_account_additional_cost();
-    let skip_cold_load = cx.gas.remaining() < cold_load_gas;
+    let skip_cold_load =
+        super::gas_budget(cx.gas, cx.state, super::BudgetUse::ColdAccount) < cold_load_gas;
     let account_address = addr.to_address();
     let account = cx
         .state

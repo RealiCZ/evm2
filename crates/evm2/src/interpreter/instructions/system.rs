@@ -77,7 +77,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
     }
 
     let additional_cold_cost = state.gas_params().cold_account_additional_cost();
-    let remaining_gas = gas.remaining();
+    let remaining_gas = super::gas_budget(gas, state, super::BudgetUse::ColdAccount);
     let skip_cold_load = remaining_gas < additional_cold_cost;
     let account =
         state.host().load_account(&to, true, skip_cold_load).map_err(|error| state.fail(error))?;
@@ -92,6 +92,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         && let Some(delegated_address) = code.eip7702_address()
     {
         cost += state.gas_params().get(GasId::WarmStorageReadCost);
+        let remaining_gas = super::gas_budget(gas, state, super::BudgetUse::DelegationGuard);
         if cost > remaining_gas {
             return Err(InstrStop::OutOfGas);
         }
@@ -123,14 +124,15 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         }
     }
     gas.spend(cost)?;
-    gas.spend_state(new_account_state_gas)?;
+    super::spend_state_reserve_first(gas, state, GasId::NewAccountState, new_account_state_gas)?;
 
     let mut gas_limit = if state.feature(EvmFeatures::EIP150) {
-        min(state.gas_params().call_stipend_reduction(gas.remaining()), stack_gas_limit)
+        let budget = super::gas_budget(gas, state, super::BudgetUse::Forward);
+        min(state.gas_params().call_stipend_reduction(budget), stack_gas_limit)
     } else {
         stack_gas_limit
     };
-    gas.spend(gas_limit)?;
+    super::spend_reserve_first(gas, state, gas_limit, super::ReserveDraw::Forward)?;
 
     if transfers_value {
         gas_limit = gas_limit.saturating_add(state.gas_params().get(GasId::CallStipend));
@@ -432,15 +434,21 @@ pub fn create_with<T: EvmTypesHost>(
         {
             charged_create_state_gas =
                 state_price(state, GasId::CreateState, StateGasSite::Account(destination))?;
-            gas.spend_state(charged_create_state_gas)?;
+            super::spend_state_reserve_first(
+                gas,
+                state,
+                GasId::CreateState,
+                charged_create_state_gas,
+            )?;
         }
     }
+    let budget = super::gas_budget(gas, state, super::BudgetUse::Forward);
     let gas_limit = if state.feature(EvmFeatures::EIP150) {
-        state.gas_params().call_stipend_reduction(gas.remaining())
+        state.gas_params().call_stipend_reduction(budget)
     } else {
-        gas.remaining()
+        budget
     };
-    gas.spend(gas_limit)?;
+    super::spend_reserve_first(gas, state, gas_limit, super::ReserveDraw::Forward)?;
 
     let mut message = MessageExt {
         kind,
@@ -494,7 +502,8 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
     require_non_staticcall(cx.state)?;
     let target = target.to_address();
     let cold_load_gas = cx.state.gas_params().selfdestruct_cold_cost();
-    let skip_cold_load = cx.gas.remaining() < cold_load_gas;
+    let skip_cold_load =
+        super::gas_budget(cx.gas, cx.state, super::BudgetUse::ColdAccount) < cold_load_gas;
     let destination = &cx.state.message().destination;
     let res = cx
         .state
@@ -511,7 +520,7 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
     // new-account state gas from the reservoir.
     if should_charge_topup && cx.state.feature(EvmFeatures::EIP8037) {
         let price = state_price(cx.state, GasId::NewAccountState, StateGasSite::Account(target))?;
-        cx.gas.spend_state(price)?;
+        super::spend_state_reserve_first(cx.gas, cx.state, GasId::NewAccountState, price)?;
     }
     if !res.previously_destroyed {
         cx.gas.record_refund(cx.state.gas_params().get(GasId::SelfdestructRefund) as i64);
