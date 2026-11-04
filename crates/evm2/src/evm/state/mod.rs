@@ -74,6 +74,7 @@ pub struct StateSnapshot {
     prewarm_set: PrewarmSet,
     journal: Vec<JournalEntry>,
     logs: Vec<Log>,
+    read_absent_storage: bool,
 }
 
 impl StateSnapshot {
@@ -88,6 +89,7 @@ impl StateSnapshot {
                     cache: self.cache,
                     db: boxed_dyn_database(db),
                     bal_context: self.bal_context,
+                    read_absent_storage: self.read_absent_storage,
                     _non_exhaustive: (),
                 },
                 prewarm_set: self.prewarm_set,
@@ -117,6 +119,7 @@ impl State<'_> {
             prewarm_set: self.prewarm_set.clone(),
             journal: self.journal.clone(),
             logs: self.logs.clone(),
+            read_absent_storage: self.database.read_absent_storage,
         }
     }
 
@@ -137,6 +140,7 @@ impl State<'_> {
             cache: self.database.cache.clone(),
             db: boxed_dyn_database(db),
             bal_context: self.database.bal_context.clone(),
+            read_absent_storage: self.database.read_absent_storage,
             _non_exhaustive: (),
         };
         database.commit(&self.accounts);
@@ -457,6 +461,12 @@ impl<'a> State<'a> {
         if let Some(account) = self.accounts.get_mut(address) {
             account.flags.set(AccountFlags::WARM, warm);
         }
+    }
+
+    /// Reads uncached storage of an account the backing database reports as absent from the
+    /// backing database, as revm does ([`CacheDB::read_absent_storage`]).
+    pub const fn set_read_absent_storage(&mut self, read: bool) {
+        self.inner.database.read_absent_storage = read;
     }
 
     /// Reads a storage slot from the committed state (accepted overlay and backing database),
@@ -1072,6 +1082,21 @@ mod tests {
             assert!(!state.account(&absent).unwrap().is_warm());
             let slot = state.storage_slot(&written, Word::ONE).unwrap();
             assert_eq!((slot.original(), slot.current()), (Word::from(7), Word::from(7)));
+        }
+    }
+
+    /// `read_absent_storage` is part of the state: a snapshot restored, a clone and a committed
+    /// copy keep it.
+    #[test]
+    fn read_absent_storage_survives_snapshots_and_copies() {
+        for read in [false, true] {
+            let mut state = State::new(CacheDB::default());
+            state.set_read_absent_storage(read);
+            let restored = state.snapshot().into_state(EmptyDB::default());
+            assert_eq!(restored.database.read_absent_storage, read, "snapshot, read={read}");
+            assert_eq!(state.clone().database.read_absent_storage, read, "clone, read={read}");
+            let copy = state.committed_copy(EmptyDB::default());
+            assert_eq!(copy.database.read_absent_storage, read, "committed copy, read={read}");
         }
     }
 
