@@ -113,6 +113,10 @@ pub struct CacheDB<ExtDB = EmptyDB> {
     /// Optional EIP-7928 Block Access List read/build state. Default is empty (no BAL attached and
     /// no builder), in which case reads go straight to the cache/database.
     pub bal_context: BalContext,
+    /// Reads uncached storage of an account the backing database reports as absent from the
+    /// backing database, as revm does, instead of answering zero without a read. Read sets
+    /// (stateless witnesses) then match revm's; values are the same for a consistent database.
+    pub read_absent_storage: bool,
     #[doc(hidden)] // Not public API. Please use an existing constructor.
     pub _non_exhaustive: (),
 }
@@ -128,7 +132,13 @@ impl<ExtDB> CacheDB<ExtDB> {
     /// Creates a new cache over a backing database.
     #[inline]
     pub fn new(db: ExtDB) -> Self {
-        Self { cache: Cache::default(), db, bal_context: BalContext::new(), _non_exhaustive: () }
+        Self {
+            cache: Cache::default(),
+            db,
+            bal_context: BalContext::new(),
+            read_absent_storage: false,
+            _non_exhaustive: (),
+        }
     }
 
     /// Applies borrowed state changes to this cache.
@@ -400,7 +410,9 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                         if storage.wiped {
                             return Ok(Word::ZERO);
                         }
-                        if self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                        if !self.read_absent_storage
+                            && self.cache.accounts.get(address).is_some_and(Option::is_none)
+                        {
                             return Ok(Word::ZERO);
                         }
                         let value = self.db.get_storage(address, key)?;
@@ -409,7 +421,9 @@ impl<ExtDB: DynDatabase> DynDatabase for CacheDB<ExtDB> {
                 }
             }
             Entry::Vacant(entry) => {
-                if self.cache.accounts.get(address).is_some_and(Option::is_none) {
+                if !self.read_absent_storage
+                    && self.cache.accounts.get(address).is_some_and(Option::is_none)
+                {
                     return Ok(Word::ZERO);
                 }
                 let value = self.db.get_storage(address, key)?;
@@ -643,6 +657,25 @@ mod tests {
         assert_eq!(cache.get_block_hash(&Word::from(5)).unwrap(), block_hash);
         assert_eq!(cache.get_block_hash(&Word::from(5)).unwrap(), block_hash);
         assert_eq!(cache.db.inner().block_hash_loads, 1);
+    }
+
+    /// Uncached storage of an account the backing database reports absent is answered as zero
+    /// without a backing read by default, and read from the database with `read_absent_storage`,
+    /// whether the account has no cached storage yet or other slots of it are cached.
+    #[test]
+    fn absent_account_storage_is_read_only_when_asked() {
+        let address = Address::with_last_byte(1);
+        for read in [false, true] {
+            let mut cache = CacheDB::new(crate::evm::Db::new(CountingDB::default()));
+            cache.read_absent_storage = read;
+            assert!(cache.get_account(&address).unwrap().is_none());
+            assert_eq!(cache.get_storage(&address, &Word::from(1)).unwrap(), Word::ZERO);
+            assert_eq!(cache.db.inner().storage_loads, usize::from(read), "read={read}");
+            // A second slot: the account's storage entry now exists, the slot is not cached.
+            cache.cache.storage.entry(address).or_default();
+            assert_eq!(cache.get_storage(&address, &Word::from(2)).unwrap(), Word::ZERO);
+            assert_eq!(cache.db.inner().storage_loads, 2 * usize::from(read), "read={read}");
+        }
     }
 
     #[test]
