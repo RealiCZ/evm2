@@ -72,6 +72,40 @@ pub trait EvmTypesHost: Sized + 'static {
         let _ = site;
         Ok(host.execution_config().version().gas_params.get(id))
     }
+
+    /// Execution gas the running frame holds outside `remaining`, read for `use_`; none by
+    /// default.
+    ///
+    /// Budget decisions see `remaining` plus this reserve: the value `GAS` pushes, the gas a call
+    /// or creation forwards, the EIP-2929 skip-cold-load checks, the EIP-7702 delegation guard
+    /// and the EIP-2200 stipend sentry. Execution charges never draw it, the code-deposit
+    /// charge included. Deductions that are not the frame's own execution draw it first, through
+    /// [`Self::draw_gas_reserve`]: the forward to a child and a state-gas spill.
+    ///
+    /// Read by the interpreter's instructions only: the JIT builtins do not consult it.
+    #[inline(always)]
+    fn gas_reserve(
+        host: &mut Self::Host<'_>,
+        use_: crate::interpreter::instructions::BudgetUse,
+    ) -> u64 {
+        let _ = (host, use_);
+        0
+    }
+
+    /// Draws up to `amount` of the running frame's reserve for `draw`; returns the amount drawn
+    /// (at most `amount`), which the caller adds to `remaining` before it deducts `amount`.
+    ///
+    /// Called by the interpreter's instructions and by the code deposit only: the JIT builtins do
+    /// not draw it.
+    #[inline(always)]
+    fn draw_gas_reserve(
+        host: &mut Self::Host<'_>,
+        amount: u64,
+        draw: crate::interpreter::instructions::ReserveDraw,
+    ) -> u64 {
+        let _ = (host, amount, draw);
+        0
+    }
 }
 
 /// Runtime EVM type family whose host is [`Evm`] for every stored-object lifetime.

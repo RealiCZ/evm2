@@ -132,7 +132,11 @@ pub(crate) const EIP2780_TX_BASE_COST: u32 = 12_000;
 pub(crate) const EIP2780_TX_VALUE_COST: u32 = 6_000;
 
 /// Tracks execution, state, and refunded gas.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing compare the gas accounting only: the halt record
+/// ([`Self::failed_charge`], [`Self::halt_remaining`]) is left out, since the inspected path
+/// keeps a record of a halt the plain path leaves in `remaining`.
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)] // Puts `remaining` first: compiled code loads it as the first word of `Gas`.
 pub struct GasTracker {
     remaining: u64,
@@ -155,9 +159,41 @@ pub struct GasTracker {
     /// parent frame so a later parent rollback can return it.
     state_gas_spilled: u64,
     refunded: i64,
-    /// The last execution-gas charge that failed: the remaining gas before it and its cost
-    /// (`cost == 0`: none). Written only on the failure side of a charge.
+    /// The gas a halt found: `[remaining, cost]` of the last execution-gas charge that failed,
+    /// `[remaining, 0]` of a halt that made no debit, `[0, 0]` when neither was recorded.
+    /// Written only on the failure side of a charge or at a no-debit halt.
     failed_charge: [u64; 2],
+}
+
+impl GasTracker {
+    /// The fields equality and hashing compare: everything but the halt record.
+    #[inline]
+    const fn accounting(&self) -> (u64, u64, u64, i64, u64, i64) {
+        (
+            self.remaining,
+            self.gas_limit,
+            self.reservoir,
+            self.state_gas_spent,
+            self.state_gas_spilled,
+            self.refunded,
+        )
+    }
+}
+
+impl PartialEq for GasTracker {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.accounting() == other.accounting()
+    }
+}
+
+impl Eq for GasTracker {}
+
+impl core::hash::Hash for GasTracker {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.accounting().hash(state);
+    }
 }
 
 impl GasTracker {
@@ -502,23 +538,52 @@ impl GasTracker {
     /// This is one debit, not the whole opcode's cost. It does not change tracer step costs.
     /// Successful charges and gas settlement preserve the record; child records are not merged.
     /// `try_spend`/`try_spend_state` failures leave the entire tracker unchanged. Prechecks such
-    /// as skipped cold loads and the SSTORE sentry do not attempt a debit and record nothing.
+    /// as skipped cold loads and the SSTORE sentry do not attempt a debit and record no failed
+    /// charge (see [`Self::record_no_debit_halt`]).
     #[inline]
     pub const fn failed_charge(&self) -> Option<(u64, u64)> {
         let [remaining, cost] = self.failed_charge;
         if cost == 0 { None } else { Some((remaining, cost)) }
     }
 
-    /// Clears the failed-charge record.
+    /// Clears the record of a failed charge or a no-debit halt.
     #[inline]
     pub const fn clear_failed_charge(&mut self) {
         self.failed_charge = [0; 2];
     }
 
-    /// Records a failed execution-gas charge of `cost` with `remaining` gas left before it.
+    /// Records a failed execution-gas charge of `cost` (non-zero) with `remaining` gas left
+    /// before it, replacing any earlier record.
     #[inline(always)]
     pub const fn record_failed_charge(&mut self, remaining: u64, cost: u64) {
+        debug_assert!(cost != 0, "a charge of nothing cannot fail");
         self.failed_charge = [remaining, cost];
+    }
+
+    /// Records a halt that made no debit (a skipped cold load, the stipend sentry, a refused
+    /// delegation) with `remaining` gas left, replacing any earlier record.
+    ///
+    /// The inspected path writes it, when the frame has no record, before it zeroes `remaining`
+    /// at an out-of-gas instruction the inspector steps, so the gas the frame had stays readable
+    /// there, as `remaining` keeps it on the plain path. An instruction the inspector does not
+    /// step is not zeroed and gets no record.
+    #[inline]
+    pub const fn record_no_debit_halt(&mut self, remaining: u64) {
+        self.failed_charge = [remaining, 0];
+    }
+
+    /// Returns the gas a halting frame had before its halt: the remaining gas before the failed
+    /// charge ([`Self::failed_charge`]), or the gas left at a halt that made no debit
+    /// ([`Self::record_no_debit_halt`]).
+    ///
+    /// `None` when neither was recorded, or a no-debit halt found no gas left: [`Self::remaining`]
+    /// then holds what the frame had (zero for such a halt on either path).
+    #[inline]
+    pub const fn halt_remaining(&self) -> Option<u64> {
+        match self.failed_charge {
+            [0, 0] => None,
+            [remaining, _] => Some(remaining),
+        }
     }
 }
 
@@ -831,6 +896,23 @@ mod tests {
         assert_eq!(gas.failed_charge(), Some((0, 5)), "a later failure replaces it");
         gas.clear_failed_charge();
         assert_eq!(gas.failed_charge(), None);
+    }
+
+    #[test]
+    fn test_halt_record_is_a_failed_charge_or_a_no_debit_halt() {
+        let mut gas = GasTracker::new(100);
+        assert_eq!(gas.halt_remaining(), None);
+        assert_matches!(gas.spend(170), Err(InstrStop::OutOfGas));
+        assert_eq!(gas.halt_remaining(), Some(100), "the failed charge's remaining before it");
+        gas.record_no_debit_halt(60);
+        assert_eq!(gas.failed_charge(), None, "a no-debit halt is not a failed charge");
+        assert_eq!(gas.halt_remaining(), Some(60), "and it replaces the earlier record");
+        gas.record_no_debit_halt(0);
+        assert_eq!(gas.halt_remaining(), None, "no gas left: nothing beyond `remaining`");
+        gas.record_failed_charge(5, 9);
+        assert_eq!((gas.failed_charge(), gas.halt_remaining()), (Some((5, 9)), Some(5)));
+        gas.clear_failed_charge();
+        assert_eq!(gas.halt_remaining(), None);
     }
 
     #[test]
