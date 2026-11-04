@@ -856,8 +856,14 @@ impl<'frame, 'host, T: EvmTypesHost> InterpreterState<'frame, 'host, T> {
         } else if self.0.result.is_err() {
             cold_path();
             if self.0.result.is_err_and(InstrStop::is_out_of_gas) {
-                // An out-of-gas frame has burned all its gas, so 0 is the real remaining gas.
-                self.0.gas.set_remaining(0);
+                // An out-of-gas frame has burned all its gas, so 0 is the real remaining gas. A
+                // halt that made no debit keeps what the frame had readable, as the plain path
+                // leaves it in `remaining`.
+                let tracker = self.0.gas.tracker_mut();
+                if tracker.halt_remaining().is_none() {
+                    tracker.record_no_debit_halt(tracker.remaining());
+                }
+                tracker.set_remaining(0);
             }
         }
         unsafe {
