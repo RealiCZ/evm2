@@ -1785,7 +1785,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 )?;
                 let code_deposit_state_gas = price.saturating_mul(output.len() as u64);
                 if code_deposit_state_gas > 0 {
-                    gas.spend_state(code_deposit_state_gas)?;
+                    crate::interpreter::instructions::spend_state_reserve_first_on::<T>(
+                        gas,
+                        self,
+                        GasId::CodeDepositState,
+                        code_deposit_state_gas,
+                    )?;
                 }
             }
         }
