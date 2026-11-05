@@ -76,6 +76,7 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         gas.spend(state.gas_params().get(GasId::TransferValueCost))?;
     }
 
+    super::before_account_load(state, &to, super::AccountLoadSite::CallTarget)?;
     let additional_cold_cost = state.gas_params().cold_account_additional_cost();
     let remaining_gas = super::gas_budget(gas, state, super::BudgetUse::ColdAccount);
     let skip_cold_load = remaining_gas < additional_cold_cost;
@@ -96,6 +97,11 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         if cost > remaining_gas {
             return Err(InstrStop::OutOfGas);
         }
+        super::before_account_load(
+            state,
+            &delegated_address,
+            super::AccountLoadSite::CallDelegate,
+        )?;
         let skip_cold_load = remaining_gas < cost.saturating_add(additional_cold_cost);
         let delegated_account = state
             .host()
@@ -394,6 +400,7 @@ pub fn create_with<T: EvmTypesHost>(
     let caller_info = if is_create2 && !state.feature(EvmFeatures::EIP8037) {
         None
     } else {
+        super::before_account_load(state, &caller, super::AccountLoadSite::CreateCaller)?;
         Some(state.host().load_account(&caller, false, false).map_err(|error| state.fail(error))?)
     };
     let destination = derive_create_destination(
@@ -430,6 +437,7 @@ pub fn create_with<T: EvmTypesHost>(
 
         // The destination is loaded here and made warm. Balance, nonce, and depth pre-access
         // failures return above before the destination is accessed.
+        super::before_account_load(state, &destination, super::AccountLoadSite::CreateDestination)?;
         if state
             .host()
             .load_account(&destination, false, false)
@@ -506,6 +514,9 @@ pub fn create_with<T: EvmTypesHost>(
 pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
     require_non_staticcall(cx.state)?;
     let target = target.to_address();
+    let contract = cx.state.message().destination;
+    super::before_account_load(cx.state, &contract, super::AccountLoadSite::SelfDestructContract)?;
+    super::before_account_load(cx.state, &target, super::AccountLoadSite::SelfDestructTarget)?;
     let cold_load_gas = cx.state.gas_params().selfdestruct_cold_cost();
     let skip_cold_load =
         super::gas_budget(cx.gas, cx.state, super::BudgetUse::ColdAccount) < cold_load_gas;
