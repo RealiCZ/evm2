@@ -1,3 +1,4 @@
+use super::AccountLoadSite;
 use crate::{
     EvmTypesHost,
     evm::AccountLoad,
@@ -11,11 +12,13 @@ fn load_account<T: EvmTypesHost>(
     cx: &mut GasInstructionCx<'_, '_, '_, T>,
     addr: Word,
     load_code: bool,
+    site: AccountLoadSite,
 ) -> Result<AccountLoad> {
+    let account_address = addr.to_address();
+    super::before_account_load(cx.state, &account_address, site)?;
     let cold_load_gas = cx.state.gas_params().cold_account_additional_cost();
     let skip_cold_load =
         super::gas_budget(cx.gas, cx.state, super::BudgetUse::ColdAccount) < cold_load_gas;
-    let account_address = addr.to_address();
     let account = cx
         .state
         .host()
@@ -52,7 +55,7 @@ pub fn address(cx: _) -> out {
 
 #[instruction(dynamic_gas)]
 pub fn balance(cx: _, [addr]: [Word]) -> Result<out> {
-    *out = load_account(&mut cx, *addr, false)?.balance;
+    *out = load_account(&mut cx, *addr, false, AccountLoadSite::Balance)?.balance;
 }
 
 #[instruction]
@@ -113,12 +116,14 @@ pub fn gasprice(cx: _) -> out {
 
 #[instruction(dynamic_gas)]
 pub fn extcodesize(cx: _, [addr]: [Word]) -> Result<out> {
-    out.write_u64(load_account(&mut cx, *addr, true)?.code.len() as u64);
+    out.write_u64(
+        load_account(&mut cx, *addr, true, AccountLoadSite::ExtCodeSize)?.code.len() as u64
+    );
 }
 
 #[instruction(dynamic_gas)]
 pub fn extcodehash(cx: _, [addr]: [Word]) -> Result<out> {
-    let account = load_account(&mut cx, *addr, false)?;
+    let account = load_account(&mut cx, *addr, false, AccountLoadSite::ExtCodeHash)?;
     *out = if account.is_empty { Word::ZERO } else { account.code_hash.into() };
 }
 
@@ -133,7 +138,7 @@ pub fn extcodecopy(cx: _, [addr, memory_offset, code_offset, len]: [Word]) -> Re
     } else {
         0
     };
-    let code = load_account(&mut cx, *addr, true)?.code;
+    let code = load_account(&mut cx, *addr, true, AccountLoadSite::ExtCodeCopy)?.code;
     cx.state.0.memory.set_data(
         memory_offset,
         code_offset.to_usize_saturated(),
