@@ -57,6 +57,7 @@ pub fn chainid(cx: _) -> Result<out> {
 #[instruction]
 pub fn selfbalance(cx: _) -> Result<out> {
     let destination = &cx.state.message().destination;
+    super::before_account_load(cx.state, destination, super::AccountLoadSite::SelfBalance)?;
     *out = cx
         .state
         .host()

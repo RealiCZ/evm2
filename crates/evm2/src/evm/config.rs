@@ -106,6 +106,22 @@ pub trait EvmTypesHost: Sized + 'static {
         let _ = (host, amount, draw);
         0
     }
+
+    /// Runs where an instruction is about to load `address`'s account at `site`: after every
+    /// charge the instruction makes before that load, before the load and its EIP-2929 skip-cold
+    /// check. Returning a stop fails the instruction there, with nothing loaded. The default
+    /// admits every load.
+    ///
+    /// Called by the interpreter's instructions only: the JIT builtins do not consult it.
+    #[inline(always)]
+    fn before_account_load(
+        state: &mut crate::interpreter::InterpreterState<'_, '_, Self>,
+        address: &alloy_primitives::Address,
+        site: crate::interpreter::instructions::AccountLoadSite,
+    ) -> crate::interpreter::Result {
+        let _ = (state, address, site);
+        Ok(())
+    }
 }
 
 /// Runtime EVM type family whose host is [`Evm`] for every stored-object lifetime.
