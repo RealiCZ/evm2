@@ -107,17 +107,21 @@ pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
     };
     let mut tx_gas =
         GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir);
-    let frame = prepare_initial_frame(
-        req.host,
-        caller,
-        sender_nonce,
-        tx.to,
-        &tx.input,
-        tx.value,
-        &mut tx_gas,
-    )?;
-    let result =
-        execute_initial_frame(req.host, frame, &mut tx_gas, execution_gas_limit, reservoir)?;
+    let result = match H::before_initial_frame(req.host, req.envelope, &mut tx_gas)? {
+        Some(result) => result,
+        None => {
+            let frame = prepare_initial_frame(
+                req.host,
+                caller,
+                sender_nonce,
+                tx.to,
+                &tx.input,
+                tx.value,
+                &mut tx_gas,
+            )?;
+            execute_initial_frame(req.host, frame, &mut tx_gas, execution_gas_limit, reservoir)?
+        }
+    };
     H::settle_transaction(
         req.host,
         req.envelope,
