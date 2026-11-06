@@ -183,6 +183,13 @@ pub fn execute_prepared<T: EvmTypes, H: TxHandlerHooks<T>>(
             &GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir),
         )
     } else {
+        // A transaction the hook settles without a frame keeps none of its delegations, as on a
+        // runtime out-of-gas.
+        if let Some(result) = H::before_initial_frame(req.host, envelope, &mut tx_gas)? {
+            let features = req.host.version().features;
+            req.host.state.rollback(runtime_checkpoint, features);
+            return settle(req.host, result);
+        }
         prepare_initial_frame(
             req.host,
             caller,
