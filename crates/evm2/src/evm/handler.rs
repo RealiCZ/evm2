@@ -1,6 +1,10 @@
 //! Transaction handler extension points.
 
-use crate::{Evm, EvmTypes, TxResult, interpreter::MessageResult, registry::HandlerResult};
+use crate::{
+    Evm, EvmTypes, TxResult,
+    interpreter::{GasTracker, MessageResult},
+    registry::HandlerResult,
+};
 use alloy_primitives::{Address, U256};
 use derive_where::derive_where;
 
@@ -48,6 +52,36 @@ pub trait TxHandlerHooks<T: EvmTypes>: Sized {
     ) -> HandlerResult<()> {
         crate::ethereum::charge_upfront(host, caller, upfront_fee)?;
         Ok(())
+    }
+
+    /// Runs after the standard pre-execution state changes and the transaction environment,
+    /// immediately before the first frame is prepared ([`prepare_initial_frame`]), on the
+    /// transaction-level gas `tx_gas` the first frame's runtime gas phase starts from.
+    ///
+    /// A type family may charge gas there before the first frame: a charge on `tx_gas` (state gas
+    /// with [`GasTracker::spend_state`], whose spill a reservoir the first frame returns unwinds
+    /// first) is the transaction's own, kept whatever the first frame's execution does, and the
+    /// first frame starts from what it leaves. A first frame whose runtime gas phase then runs out
+    /// of gas settles from the gas the transaction started with, dropping the charge with the
+    /// phase's own ([`execute_initial_frame`]).
+    ///
+    /// Or it may settle the transaction without a frame by returning its result, such as an
+    /// included out-of-gas ([`runtime_oog_result`](crate::ethereum::runtime_oog_result)), which
+    /// [`Self::settle_transaction`] then settles as a first frame's. An EIP-7702 transaction runs
+    /// it after its authorizations are applied, and one settled here keeps none of them, as on a
+    /// runtime out-of-gas.
+    ///
+    /// The default charges nothing and runs the first frame.
+    ///
+    /// [`prepare_initial_frame`]: crate::ethereum::prepare_initial_frame
+    /// [`execute_initial_frame`]: crate::ethereum::execute_initial_frame
+    #[inline]
+    fn before_initial_frame(
+        _host: &mut Evm<'_, T>,
+        _envelope: &T::Tx,
+        _tx_gas: &mut GasTracker,
+    ) -> HandlerResult<Option<MessageResult<T>>> {
+        Ok(None)
     }
 
     /// Settles a transaction after execution and rollback handling.

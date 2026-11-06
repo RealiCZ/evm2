@@ -729,3 +729,276 @@ fn apply_auth_list_accepts_custom_filtered_authorizations() {
     let per_auth = evm.version().gas_params.get(GasId::TxEip7702AuthRefund);
     assert_eq!(refunds.execution_refund, per_auth);
 }
+
+mod before_initial_frame {
+    use super::*;
+    use crate::{
+        TxResult,
+        ethereum::{eip1559, eip2930, eip4844, eip7702, legacy, runtime_oog_result},
+        evm::handler::{DefaultTxHandlerHooks, TxHandlerHooks},
+        interpreter::MessageResult,
+        registry::{HandlerResult, handler},
+    };
+    use alloy_consensus::{TxEip4844, TxEip4844Variant};
+    use alloy_primitives::B256;
+    use core::cell::Cell;
+
+    const CALLER: Address = Address::with_last_byte(0xb1);
+    const RECIPIENT: Address = Address::with_last_byte(0xb2);
+    const AUTHORITY: Address = Address::with_last_byte(0xb3);
+    const DELEGATE: Address = Address::with_last_byte(0xb4);
+    const GAS_LIMIT: u64 = 1_000_000;
+    const CHARGE: u64 = 40_000;
+
+    std::thread_local! {
+        static SEEN: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    }
+
+    fn registry<H: TxHandlerHooks<BaseEvmTypes> + 'static>()
+    -> TxRegistry<BaseEvmTypes, TxResult<BaseEvmTypes>> {
+        type T = BaseEvmTypes;
+        TxRegistry::new()
+            .with_handler(
+                0,
+                TxEnvelope::as_legacy,
+                handler(legacy::prepare_with_hooks::<T, H>, legacy::execute_prepared::<T, H>),
+            )
+            .with_handler(
+                1,
+                TxEnvelope::as_eip2930,
+                handler(eip2930::prepare_with_hooks::<T, H>, eip2930::execute_prepared::<T, H>),
+            )
+            .with_handler(
+                2,
+                TxEnvelope::as_eip1559,
+                handler(eip1559::prepare_with_hooks::<T, H>, eip1559::execute_prepared::<T, H>),
+            )
+            .with_handler(
+                3,
+                TxEnvelope::as_eip4844,
+                handler(eip4844::prepare_with_hooks::<T, H>, eip4844::execute_prepared::<T, H>),
+            )
+            .with_handler(
+                4,
+                TxEnvelope::as_eip7702,
+                handler(eip7702::prepare_with_hooks::<T, H>, eip7702::execute_prepared::<T, H>),
+            )
+    }
+
+    /// The recipient returns the gas its frame starts with (`GAS`) and stores 1 in slot 1, or
+    /// reverts after reading it.
+    fn evm<H: TxHandlerHooks<BaseEvmTypes> + 'static>(reverts: bool) -> TestEvm {
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &CALLER,
+            AccountInfo { balance: U256::from(u64::MAX), ..Default::default() },
+        );
+        let mut code = vec![op::GAS, op::PUSH1, 1, op::PUSH1, 1, op::SSTORE];
+        if reverts {
+            code.extend([op::PUSH0, op::MSTORE, op::PUSH1, 32, op::PUSH0, op::REVERT]);
+        } else {
+            return_top_word(&mut code);
+        }
+        database.insert_account_info(
+            &RECIPIENT,
+            AccountInfo::default().with_nonce(1).with_code(legacy_bytecode(code)),
+        );
+        TestEvm::new(
+            SpecId::AMSTERDAM,
+            BlockEnvExt::default(),
+            registry::<H>(),
+            database,
+            Precompiles::base(SpecId::AMSTERDAM),
+        )
+    }
+
+    fn tx(tx_type: u8) -> RecoveredTxEnvelope {
+        let chain_id = Version::new(SpecId::AMSTERDAM).chain_id;
+        let to = TxKind::Call(RECIPIENT);
+        let tx = match tx_type {
+            0 => TxEnvelope::Legacy(TxLegacy { gas_limit: GAS_LIMIT, to, ..Default::default() }),
+            1 => TxEnvelope::Eip2930(TxEip2930 {
+                chain_id,
+                gas_limit: GAS_LIMIT,
+                to,
+                ..Default::default()
+            }),
+            2 => TxEnvelope::Eip1559(TxEip1559 {
+                chain_id,
+                gas_limit: GAS_LIMIT,
+                to,
+                ..Default::default()
+            }),
+            3 => TxEnvelope::Eip4844(TxEip4844Variant::TxEip4844(TxEip4844 {
+                chain_id,
+                gas_limit: GAS_LIMIT,
+                to: RECIPIENT,
+                blob_versioned_hashes: vec![B256::with_last_byte(1).with_first_byte(1)],
+                max_fee_per_blob_gas: 1,
+                ..Default::default()
+            })),
+            4 => TxEnvelope::Eip7702(LazyTxEip7702::from_cached_recovered_authorizations(
+                TxEip7702 {
+                    chain_id,
+                    gas_limit: GAS_LIMIT,
+                    to: RECIPIENT,
+                    authorization_list: vec![unsigned(Authorization {
+                        chain_id: U256::ZERO,
+                        address: DELEGATE,
+                        nonce: 0,
+                    })],
+                    ..Default::default()
+                },
+                vec![Some(AUTHORITY)],
+            )),
+            _ => unreachable!(),
+        };
+        Recovered::new_unchecked(tx, CALLER)
+    }
+
+    trait WithFirstByte {
+        fn with_first_byte(self, byte: u8) -> Self;
+    }
+
+    impl WithFirstByte for B256 {
+        fn with_first_byte(mut self, byte: u8) -> Self {
+            self.0[0] = byte;
+            self
+        }
+    }
+
+    /// Runs `tx_type` with hooks `H`: the result, the recipient's slot 1 and whether the
+    /// authority was delegated.
+    fn run<H: TxHandlerHooks<BaseEvmTypes> + 'static>(
+        tx_type: u8,
+        reverts: bool,
+    ) -> (TxResult<BaseEvmTypes>, Word, bool) {
+        let mut evm = evm::<H>(reverts);
+        let result = evm.transact(&tx(tx_type)).unwrap().commit();
+        let slot = evm.state.storage_slot(&RECIPIENT, Word::ONE).unwrap().current();
+        let delegated = evm
+            .state
+            .account_info_untracked(&AUTHORITY)
+            .unwrap()
+            .is_some_and(|info| info.code_hash == Bytecode::new_eip7702(DELEGATE).hash_slow());
+        (result, slot, delegated)
+    }
+
+    /// The frame's starting gas the recipient returned.
+    fn frame_gas(result: &TxResult<BaseEvmTypes>) -> u64 {
+        U256::from_be_slice(&result.output).to::<u64>()
+    }
+
+    /// Observes where the hook runs and then does what the default does.
+    struct Observe;
+
+    impl TxHandlerHooks<BaseEvmTypes> for Observe {
+        fn before_initial_frame(
+            host: &mut Evm<'_, BaseEvmTypes>,
+            envelope: &TxEnvelope,
+            tx_gas: &mut GasTracker,
+        ) -> HandlerResult<Option<MessageResult<BaseEvmTypes>>> {
+            // After the transaction environment and the pre-execution changes: the sender's nonce
+            // is bumped, an EIP-7702 authority applied, the recipient not yet loaded for the frame.
+            assert_eq!(Host::tx_env(host).origin, CALLER);
+            assert_eq!(host.state.account_info_untracked(&CALLER).unwrap().unwrap().nonce, 1);
+            if envelope.as_eip7702().is_some() {
+                let authority = host.state.account_info_untracked(&AUTHORITY).unwrap().unwrap();
+                assert_eq!(authority.code_hash, Bytecode::new_eip7702(DELEGATE).hash_slow());
+            }
+            SEEN.with(|seen| {
+                assert!(seen.get().is_none(), "runs once per transaction");
+                seen.set(Some((tx_gas.remaining(), tx_gas.reservoir())));
+            });
+            <DefaultTxHandlerHooks as TxHandlerHooks<BaseEvmTypes>>::before_initial_frame(
+                host, envelope, tx_gas,
+            )
+        }
+    }
+
+    /// Charges `CHARGE` of state gas before the first frame.
+    struct Charge;
+
+    impl TxHandlerHooks<BaseEvmTypes> for Charge {
+        fn before_initial_frame(
+            _host: &mut Evm<'_, BaseEvmTypes>,
+            _envelope: &TxEnvelope,
+            tx_gas: &mut GasTracker,
+        ) -> HandlerResult<Option<MessageResult<BaseEvmTypes>>> {
+            tx_gas.spend_state(CHARGE).unwrap();
+            Ok(None)
+        }
+    }
+
+    /// Settles every transaction without a frame, as an included out-of-gas.
+    struct Settle;
+
+    impl TxHandlerHooks<BaseEvmTypes> for Settle {
+        fn before_initial_frame(
+            _host: &mut Evm<'_, BaseEvmTypes>,
+            _envelope: &TxEnvelope,
+            tx_gas: &mut GasTracker,
+        ) -> HandlerResult<Option<MessageResult<BaseEvmTypes>>> {
+            Ok(Some(runtime_oog_result(tx_gas.limit(), tx_gas.reservoir())))
+        }
+    }
+
+    /// The default hook runs once, after the transaction environment and the pre-execution
+    /// changes, immediately before the first frame, on the gas the first frame starts from, and
+    /// changes nothing.
+    #[rstest::rstest]
+    fn default_runs_before_the_first_frame_and_changes_nothing(
+        #[values(0, 1, 2, 3, 4)] tx_type: u8,
+    ) {
+        SEEN.with(|seen| seen.set(None));
+        let (observed, slot, delegated) = run::<Observe>(tx_type, false);
+        let (default, default_slot, default_delegated) =
+            run::<DefaultTxHandlerHooks>(tx_type, false);
+        assert!(default.status, "{default:?}");
+        assert_eq!(observed, default);
+        assert_eq!((slot, delegated), (default_slot, default_delegated));
+        assert_eq!(slot, Word::ONE);
+        assert_eq!(delegated, tx_type == 4);
+        let (remaining, reservoir) = SEEN.with(Cell::get).expect("the hook ran");
+        // The first frame starts on what the hook saw, less the `GAS` instruction's own cost.
+        assert_eq!(frame_gas(&default), remaining - 2);
+        assert_eq!(reservoir, 0);
+    }
+
+    /// A state charge before the first frame is the transaction's: the first frame starts from
+    /// what it leaves, and a reverting first frame keeps it charged.
+    #[rstest::rstest]
+    fn a_state_charge_before_the_first_frame_is_kept(
+        #[values(0, 1, 2, 3, 4)] tx_type: u8,
+        #[values(false, true)] reverts: bool,
+    ) {
+        let (charged, ..) = run::<Charge>(tx_type, reverts);
+        let (default, ..) = run::<DefaultTxHandlerHooks>(tx_type, reverts);
+        assert_eq!(charged.status, !reverts);
+        assert_eq!(default.status, !reverts);
+        // Below the cap the reservoir is empty: the charge spills into the regular gas.
+        assert_eq!(frame_gas(&charged), frame_gas(&default) - CHARGE);
+        assert_eq!(charged.total_gas_spent, default.total_gas_spent + CHARGE);
+        assert_eq!(charged.state_gas_spent, default.state_gas_spent + CHARGE);
+    }
+
+    /// A transaction the hook settles runs no frame: it is included with the result the hook
+    /// gave (an out-of-gas burning its execution gas), its nonce bumped, nothing of its frame made
+    /// and, for EIP-7702, its delegations rolled back.
+    #[rstest::rstest]
+    fn a_transaction_settled_before_the_first_frame_runs_none(
+        #[values(0, 1, 2, 3, 4)] tx_type: u8,
+    ) {
+        let mut evm = evm::<Settle>(false);
+        let result = evm.transact(&tx(tx_type)).unwrap().commit();
+        assert!(!result.status);
+        assert_eq!(result.stop, InstrStop::OutOfGas);
+        assert_eq!(result.total_gas_spent, GAS_LIMIT);
+        assert_eq!(result.state_gas_spent, 0);
+        assert!(result.output.is_empty());
+        assert_eq!(evm.state.account_info_untracked(&CALLER).unwrap().unwrap().nonce, 1);
+        assert_eq!(evm.state.storage_slot(&RECIPIENT, Word::ONE).unwrap().current(), Word::ZERO);
+        let authority = evm.state.account_info_untracked(&AUTHORITY).unwrap();
+        assert!(authority.as_ref().is_none_or(|info| info.is_empty()), "{authority:?}");
+    }
+}
