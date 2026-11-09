@@ -253,6 +253,32 @@ evm_features! {
     ///
     /// Default: on since Amsterdam
     EIP2780,
+    /// Credits every [EIP-8037](https://eips.ethereum.org/EIPS/eip-8037) give-back of state gas to
+    /// a reservoir, never to execution gas: a refill (a storage slot written back to zero, the
+    /// upfront account charge of a failed call or creation), the reservoir a child returns, and a
+    /// failed frame's rollback.
+    ///
+    /// A frame's execution gas then rises only by the execution gas a child returns. A frame that
+    /// reverts gives the state charges it and its successful children made, net of the give-backs
+    /// they received, back into its own reservoir; one that halts exceptionally gets back the
+    /// reservoir it received and consumes its execution gas, with the state gas that gas paid. A
+    /// transaction whose first frame halts keeps the part of that frame's upfront account charge
+    /// that execution gas paid ([`GasTracker::settle_gas_into_reservoir`],
+    /// [`GasTracker::merge_child_gas_into_reservoir`], [`GasTracker::refill_reservoir_only`]).
+    ///
+    /// Without it EIP-8037 credits a give-back to execution gas first, up to the state gas the
+    /// frame paid from it. Requires [`Self::EIP8037`].
+    ///
+    /// The rule is the interpreter's: the JIT builtins keep EIP-8037's.
+    ///
+    /// [`GasTracker::settle_gas_into_reservoir`]:
+    ///     crate::interpreter::GasTracker::settle_gas_into_reservoir
+    /// [`GasTracker::merge_child_gas_into_reservoir`]:
+    ///     crate::interpreter::GasTracker::merge_child_gas_into_reservoir
+    /// [`GasTracker::refill_reservoir_only`]: crate::interpreter::GasTracker::refill_reservoir_only
+    ///
+    /// Default: off
+    EIP8037_RESERVOIR_REFILLS,
 }
 
 #[cfg(test)]

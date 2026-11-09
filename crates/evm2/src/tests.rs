@@ -236,6 +236,171 @@ fn eip8037_sibling_refill_restores_parent_gas_left() {
     assert_eq!(result.output, baseline.output);
 }
 
+/// Amsterdam without EIP-2780, a fresh slot at 200,000 of state gas, and the reservoir-only rule
+/// ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]) on or off.
+fn state_gas_version(reservoir_refills: bool) -> Version {
+    let mut version = Version::new(SpecId::AMSTERDAM);
+    version.features.remove(EvmFeatures::EIP2780);
+    version.features.set(EvmFeatures::EIP8037_RESERVOIR_REFILLS, reservoir_refills);
+    version.gas_params.set(GasId::SstoreSetState, 200_000);
+    version
+}
+
+fn run_with_version(
+    database: &InMemoryDB,
+    version: Version,
+    tx: &RecoveredTxEnvelope,
+) -> crate::TxResult<BaseEvmTypes> {
+    let mut evm = TestEvm::new_with_execution_config(
+        ExecutionConfig::for_spec_and_version(SpecId::AMSTERDAM, version),
+        SpecId::AMSTERDAM,
+        BlockEnvExt::default(),
+        ethereum_tx_registry(SpecId::AMSTERDAM),
+        database.clone(),
+        Precompiles::base(SpecId::AMSTERDAM),
+    );
+    evm.transact(tx).unwrap().discard()
+}
+
+/// `GAS` as the frame's 32-byte output.
+fn return_gas(code: &mut Vec<u8>) {
+    code.extend([op::GAS, op::PUSH1, 0, op::MSTORE, op::PUSH1, 32, op::PUSH1, 0, op::RETURN]);
+}
+
+/// `kind(GAS, target, 0, 0, 0, 0[, 0]) POP`.
+fn call_all_gas(code: &mut Vec<u8>, kind: u8, target: Address) {
+    let args = if kind == op::CALL { 5 } else { 4 };
+    for _ in 0..args {
+        code.extend([op::PUSH1, 0]);
+    }
+    code.push(op::PUSH20);
+    code.extend_from_slice(target.as_slice());
+    code.extend([op::GAS, kind, op::POP]);
+}
+
+fn gas_word(result: &crate::TxResult<BaseEvmTypes>) -> u64 {
+    U256::from_be_slice(&result.output).to::<u64>()
+}
+
+/// A contract database with a funded caller, and a call to the first contract.
+fn contracts(caller: Address, list: &[(Address, Vec<u8>)]) -> (InMemoryDB, RecoveredTxEnvelope) {
+    let mut database = InMemoryDB::default();
+    for (address, code) in list {
+        database.insert_account_info(
+            address,
+            AccountInfo::default().with_nonce(1).with_code(legacy_bytecode(code.clone())),
+        );
+    }
+    database.insert_account_info(
+        &caller,
+        AccountInfo { balance: U256::from(u64::MAX), ..Default::default() },
+    );
+    let tx = Recovered::new_unchecked(
+        TxEnvelope::Legacy(TxLegacy {
+            gas_limit: 1_000_000,
+            to: TxKind::Call(list[0].0),
+            ..Default::default()
+        }),
+        caller,
+    );
+    (database, tx)
+}
+
+#[test]
+fn eip8037_reservoir_refills_keep_a_sibling_refill_out_of_gas_left() {
+    let (parent, setter, clearer) =
+        (Address::repeat_byte(0x11), Address::repeat_byte(0xa1), Address::repeat_byte(0xb2));
+    let mut parent_code = Vec::new();
+    call_all_gas(&mut parent_code, op::DELEGATECALL, setter);
+    call_all_gas(&mut parent_code, op::DELEGATECALL, clearer);
+    return_gas(&mut parent_code);
+    let (database, tx) = contracts(
+        Address::repeat_byte(0xcc),
+        &[
+            (parent, parent_code),
+            (setter, vec![op::PUSH1, 1, op::PUSH1, 0, op::SSTORE, op::STOP]),
+            (clearer, vec![op::PUSH1, 0, op::PUSH1, 0, op::SSTORE, op::STOP]),
+        ],
+    );
+
+    let eip8037 = run_with_version(&database, state_gas_version(false), &tx);
+    let reservoir_only = run_with_version(&database, state_gas_version(true), &tx);
+    assert!(eip8037.is_success() && reservoir_only.is_success());
+    // The clearer's refill is the reservoir's: the setter's spilled 200,000 stay out of `GAS`.
+    assert_eq!(gas_word(&reservoir_only) + 200_000, gas_word(&eip8037));
+    // The reservoir returns to the sender, so the transaction spends the same.
+    assert_eq!(reservoir_only.total_gas_spent, eip8037.total_gas_spent);
+    assert_eq!(reservoir_only.state_gas_spent(), 0);
+}
+
+#[test]
+fn eip8037_reservoir_refills_return_a_reverted_childs_state_gas_as_reservoir() {
+    let (parent, child) = (Address::repeat_byte(0x11), Address::repeat_byte(0xa1));
+    // SSTORE(0, 1), REVERT(0, 0): the fresh slot spills 200,000 into the child's gas.
+    let child_code =
+        vec![op::PUSH1, 1, op::PUSH1, 0, op::SSTORE, op::PUSH1, 0, op::DUP1, op::REVERT];
+    let run = |parent_writes: bool, reservoir_refills: bool| {
+        let mut code = Vec::new();
+        call_all_gas(&mut code, op::CALL, child);
+        if parent_writes {
+            code.extend([op::PUSH1, 1, op::PUSH1, 1, op::SSTORE]);
+        }
+        return_gas(&mut code);
+        let (database, tx) =
+            contracts(Address::repeat_byte(0xcc), &[(parent, code), (child, child_code.clone())]);
+        run_with_version(&database, state_gas_version(reservoir_refills), &tx)
+    };
+
+    // The revert puts the child's 200,000 into its reservoir, which joins the parent's: the
+    // parent's `GAS` does not get them back.
+    let (eip8037, reservoir_only) = (run(false, false), run(false, true));
+    assert_eq!(gas_word(&reservoir_only) + 200_000, gas_word(&eip8037));
+    assert_eq!(reservoir_only.total_gas_spent, eip8037.total_gas_spent);
+
+    // A fresh slot the parent then writes is paid from that reservoir, not from its gas: both
+    // rules leave the parent the same `GAS`.
+    let (eip8037, reservoir_only) = (run(true, false), run(true, true));
+    assert_eq!(gas_word(&reservoir_only), gas_word(&eip8037));
+    assert_eq!(reservoir_only.state_gas_spent(), 200_000);
+    assert_eq!(reservoir_only.total_gas_spent, eip8037.total_gas_spent);
+}
+
+#[test]
+fn eip8037_reservoir_refills_consume_the_spilled_part_of_a_halted_first_frames_charge() {
+    let caller = Address::repeat_byte(0xcc);
+    let mut database = InMemoryDB::default();
+    database.insert_account_info(
+        &caller,
+        AccountInfo { balance: U256::from(u64::MAX), ..Default::default() },
+    );
+    // A creation whose initcode halts. The execution gas is capped at 100,000, so 150,000 of the
+    // gas limit is reservoir: the created account's 180,000 take all of it and spill 30,000.
+    let tx = Recovered::new_unchecked(
+        TxEnvelope::Legacy(TxLegacy {
+            gas_limit: 250_000,
+            to: TxKind::Create,
+            input: vec![op::INVALID].into(),
+            ..Default::default()
+        }),
+        caller,
+    );
+    let version = |reservoir_refills| {
+        let mut version = state_gas_version(reservoir_refills);
+        version.tx_gas_limit_cap = 100_000;
+        version.gas_params.set(GasId::CreateState, 180_000);
+        version
+    };
+    let eip8037 = run_with_version(&database, version(false), &tx);
+    let reservoir_only = run_with_version(&database, version(true), &tx);
+    assert_eq!(reservoir_only.stop, InstrStop::InvalidFEOpcode);
+    // The reservoir's 150,000 return to the sender; the 30,000 the execution gas paid are
+    // consumed with it, as execution gas: no account was created, so no state gas is kept.
+    assert_eq!(reservoir_only.total_gas_spent, 100_000);
+    assert_eq!(eip8037.total_gas_spent, 100_000);
+    assert_eq!(reservoir_only.state_gas_spent(), 0);
+    assert_eq!(eip8037.state_gas_spent(), 0);
+}
+
 #[test]
 fn eip2780_authorization_charges_no_state_gas_without_eip8037() {
     let caller = Address::repeat_byte(0xbb);

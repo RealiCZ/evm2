@@ -106,7 +106,8 @@ pub fn sstore_with<T: EvmTypesHost>(
 
         // EIP-8037: a 0→x→0 storage restoration returns the state gas charged for
         // the initial 0→x transition directly to the reservoir, rather than
-        // routing it through the capped refund counter below.
+        // routing it through the capped refund counter below (by the version's
+        // give-back rule, `give_back_state_gas`).
         if state.gas_params().sstore_state_gas_refill(&state_load) != 0 {
             let price = T::state_gas_price(
                 state.host(),
@@ -114,7 +115,7 @@ pub fn sstore_with<T: EvmTypesHost>(
                 StateGasSite::Storage(*destination, *key),
             )
             .map_err(|e| state.fail(e))?;
-            gas.refill_reservoir(price);
+            super::give_back_state_gas(gas, state, price);
         }
     }
 

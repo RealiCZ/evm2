@@ -3,7 +3,8 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 use evm2::{
-    BaseEvmConfigSelector, Evm, EvmTypesHost, MessageHooks, NoopInspector, SpecId,
+    BaseEvmConfigSelector, Evm, EvmFeatures, EvmTypesHost, ExecutionConfig, MessageHooks,
+    NoopInspector, SpecId, Version,
     bytecode::Bytecode,
     env::BlockEnv,
     evm::{AccountInfo, InMemoryDB},
@@ -33,6 +34,8 @@ const PARENT: Address = Address::with_last_byte(0xaa);
 const CODE: Address = Address::with_last_byte(0xc0);
 const EMPTY: Address = Address::with_last_byte(0xe0);
 const IDENTITY: Address = Address::with_last_byte(0x04);
+/// A creation whose code deposit the hook refuses with a revert, without checking its gas.
+const REFUSED: Address = Address::with_last_byte(0xa3);
 
 /// Value-calls `to` with all gas; stores the success word at slot `slot`.
 fn call(code: &mut Vec<u8>, to: Address, slot: u8) {
@@ -145,6 +148,9 @@ impl MessageHooks<Types> for Recorder {
         if m.destination == Address::with_last_byte(0xa2) {
             assert_eq!(before.remaining(), 292);
             assert_eq!(gas.remaining(), 92);
+            return Ok(Some((InstrStop::Revert, Bytes::from_static(b"refused"))));
+        }
+        if m.destination == REFUSED {
             return Ok(Some((InstrStop::Revert, Bytes::from_static(b"refused"))));
         }
         Ok(None)
@@ -335,12 +341,23 @@ fn create_collision_reaches_before_commit_on_both_paths() {
 }
 
 fn deploy(evm: &mut Evm<'_, Types>, address: Address, gas: u64) -> MessageResult<Types> {
+    deploy_with_reservoir(evm, address, gas, 0)
+}
+
+/// Deploys the one byte `0x00` from `PUSH1 1; PUSH0; RETURN` (8 of execution gas).
+fn deploy_with_reservoir(
+    evm: &mut Evm<'_, Types>,
+    address: Address,
+    gas: u64,
+    reservoir: u64,
+) -> MessageResult<Types> {
     let mut message = Message::<Types> {
         kind: MessageKind::Create,
         destination: address,
         call_target: address,
         caller: PARENT,
         gas_limit: gas,
+        reservoir,
         code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 1, op::PUSH0, op::RETURN])),
         ..Default::default()
     };
@@ -357,6 +374,54 @@ fn code_admission_revert_restores_predeposit_gas_and_rolls_back_creation() {
     assert_eq!(result.gas.remaining(), 292);
     assert_eq!(result.created_address, None);
     assert!(evm.state_mut().account(&address).unwrap().get().is_none());
+}
+
+/// Amsterdam, where a code deposit costs keccak word gas and state gas, with the reservoir-only
+/// rule on or off.
+fn amsterdam_evm(reservoir_refills: bool) -> Evm<'static, Types> {
+    let mut version = Version::new(SpecId::AMSTERDAM);
+    version.features.set(EvmFeatures::EIP8037_RESERVOIR_REFILLS, reservoir_refills);
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(&PARENT, AccountInfo::default());
+    Evm::new_with_execution_config_and_ext(
+        ExecutionConfig::for_spec_and_version(SpecId::AMSTERDAM, version),
+        SpecId::AMSTERDAM,
+        BlockEnv::<Types>::default(),
+        TxRegistry::new(),
+        db,
+        Precompiles::base(SpecId::AMSTERDAM),
+        Vec::new(),
+    )
+}
+
+/// The refused deposit of one byte charges 6 of hashing and 1,530 of state gas. EIP-8037's rule
+/// restores the gas from before the deposit; the reservoir-only rule keeps the hashing spent and
+/// gives the state charge back into the reservoir, whichever pool paid it.
+#[test]
+fn code_admission_revert_under_the_reservoir_only_rule_gives_the_deposit_state_gas_to_the_reservoir()
+ {
+    const HASHING: u64 = 6;
+    const DEPOSIT_STATE: u64 = 1_530;
+    for (reservoir, refills, remaining, reservoir_left) in [
+        (0, false, 100_000 - 8, 0),
+        (5_000, false, 100_000 - 8, 5_000),
+        (0, true, 100_000 - 8 - HASHING - DEPOSIT_STATE, DEPOSIT_STATE),
+        (5_000, true, 100_000 - 8 - HASHING, 5_000),
+    ] {
+        let mut evm = amsterdam_evm(refills);
+        let result = deploy_with_reservoir(&mut evm, REFUSED, 100_000, reservoir);
+        let case = format!("reservoir={reservoir} refills={refills}");
+        assert_eq!(result.stop, InstrStop::Revert, "{case}");
+        assert_eq!(result.output.as_ref(), b"refused", "{case}");
+        assert_eq!(
+            (result.gas.remaining(), result.gas.reservoir()),
+            (remaining, reservoir_left),
+            "{case}"
+        );
+        assert_eq!(result.gas.state_gas_spent(), 0, "{case}");
+        assert_eq!(result.created_address, None, "{case}");
+        assert!(evm.state_mut().account(&REFUSED).unwrap().get().is_none(), "{case}");
+    }
 }
 
 /// Steps every opcode, so an inspected run takes the inspect table, which zeroes `remaining` on an
