@@ -171,6 +171,14 @@ gas_ids! {
     TxValueCost;
     /// EIP-2780/EIP-8038 execution gas cost of a top-level CREATE access.
     TxCreateAccessCost;
+    /// Part of `SstoreSetState` execution gas pays before the reservoir (legacy share); zero in Ethereum.
+    SstoreSetStateLegacyShare;
+    /// Part of a value `CALL`'s `NewAccountState` execution gas pays first (legacy share); zero in Ethereum.
+    CallNewAccountStateLegacyShare;
+    /// Part of a `SELFDESTRUCT`'s `NewAccountState` execution gas pays first (legacy share); zero in Ethereum.
+    SelfdestructNewAccountStateLegacyShare;
+    /// Part of a `CREATE`'s `CreateState` execution gas pays first (legacy share); zero in Ethereum.
+    CreateStateLegacyShare;
 
     // Reserved custom gas parameter slots.
 

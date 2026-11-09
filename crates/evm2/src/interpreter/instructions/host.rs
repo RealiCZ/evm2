@@ -101,7 +101,13 @@ pub fn sstore_with<T: EvmTypesHost>(
                 StateGasSite::Storage(*destination, *key),
             )
             .map_err(|e| state.fail(e))?;
-            super::spend_state_reserve_first(gas, state, GasId::SstoreSetState, price)?;
+            super::spend_state_with_share_reserve_first(
+                gas,
+                state,
+                GasId::SstoreSetState,
+                GasId::SstoreSetStateLegacyShare,
+                price,
+            )?;
         }
 
         // EIP-8037: a 0→x→0 storage restoration returns the state gas charged for

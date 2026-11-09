@@ -401,6 +401,118 @@ fn eip8037_reservoir_refills_consume_the_spilled_part_of_a_halted_first_frames_c
     assert_eq!(eip8037.state_gas_spent(), 0);
 }
 
+/// The gas a code segment costs its frame: `GAS`, the segment, `GAS`, their difference returned.
+fn measure(segment: &[u8]) -> Vec<u8> {
+    let mut code = vec![op::GAS];
+    code.extend_from_slice(segment);
+    code.extend([op::GAS, op::SWAP1, op::SUB]);
+    code.extend([op::PUSH1, 0, op::MSTORE, op::PUSH1, 32, op::PUSH1, 0, op::RETURN]);
+    code
+}
+
+/// Runs a call to `code` at [`Address::repeat_byte(0x11)`], which holds 1 wei, with a 2,500,000
+/// reservoir above a 500,000 execution cap, with `shares` set on the version.
+fn run_shared(code: Vec<u8>, extra: &[(Address, Vec<u8>, u64)], shares: &[(GasId, u32)]) -> u64 {
+    let caller = Address::repeat_byte(0xcc);
+    let target = Address::repeat_byte(0x11);
+    let mut database = InMemoryDB::default();
+    database.insert_account_info(
+        &target,
+        AccountInfo::default()
+            .with_nonce(1)
+            .with_balance(U256::from(1))
+            .with_code(legacy_bytecode(code)),
+    );
+    for (address, code, balance) in extra {
+        database.insert_account_info(
+            address,
+            AccountInfo::default()
+                .with_nonce(1)
+                .with_balance(U256::from(*balance))
+                .with_code(legacy_bytecode(code.clone())),
+        );
+    }
+    database.insert_account_info(
+        &caller,
+        AccountInfo { balance: U256::from(u64::MAX), ..Default::default() },
+    );
+    let tx = Recovered::new_unchecked(
+        TxEnvelope::Legacy(TxLegacy {
+            gas_limit: 3_000_000,
+            to: TxKind::Call(target),
+            ..Default::default()
+        }),
+        caller,
+    );
+    let mut version = state_gas_version(true);
+    version.tx_gas_limit_cap = 500_000;
+    for (id, share) in shares {
+        version.gas_params.set(*id, *share);
+    }
+    let result = run_with_version(&database, version, &tx);
+    assert!(result.is_success(), "{result:?}");
+    gas_word(&result)
+}
+
+#[test]
+fn legacy_share_of_a_fresh_slot_is_taken_from_execution_gas() {
+    let code = measure(&[op::PUSH1, 1, op::PUSH1, 0, op::SSTORE]);
+    let plain = run_shared(code.clone(), &[], &[]);
+    let shared = run_shared(code.clone(), &[], &[(GasId::SstoreSetStateLegacyShare, 10_000)]);
+    assert_eq!(shared, plain + 10_000);
+    // A share above the charge is the whole charge: the reservoir pays none of the 200,000.
+    let whole = run_shared(code, &[], &[(GasId::SstoreSetStateLegacyShare, 300_000)]);
+    assert_eq!(whole, plain + 200_000);
+}
+
+#[test]
+fn legacy_share_of_a_value_calls_new_account_is_taken_before_the_forward() {
+    let empty = Address::repeat_byte(0xe0);
+    // CALL(0, empty, 1, 0, 0, 0, 0) POP: only the stipend is forwarded, and returned.
+    let mut segment = vec![op::PUSH1, 0, op::PUSH1, 0, op::PUSH1, 0, op::PUSH1, 0, op::PUSH1, 1];
+    segment.push(op::PUSH20);
+    segment.extend_from_slice(empty.as_slice());
+    segment.extend([op::PUSH1, 0, op::CALL, op::POP]);
+    let code = measure(&segment);
+    let plain = run_shared(code.clone(), &[], &[]);
+    let shared = run_shared(code.clone(), &[], &[(GasId::CallNewAccountStateLegacyShare, 25_000)]);
+    assert_eq!(shared, plain + 25_000);
+    // The other entries' shares do not apply to a call.
+    let others = [
+        (GasId::SelfdestructNewAccountStateLegacyShare, 16_000),
+        (GasId::CreateStateLegacyShare, 20_000),
+    ];
+    assert_eq!(run_shared(code, &[], &others), plain);
+}
+
+#[test]
+fn legacy_share_of_a_creation_is_taken_before_the_forward() {
+    // CREATE(0, 0, 0) POP: the child returns its whole forward.
+    let code = measure(&[op::PUSH1, 0, op::PUSH1, 0, op::PUSH1, 0, op::CREATE, op::POP]);
+    let plain = run_shared(code.clone(), &[], &[]);
+    let shared = run_shared(code, &[], &[(GasId::CreateStateLegacyShare, 20_000)]);
+    assert_eq!(shared, plain + 20_000);
+}
+
+#[test]
+fn legacy_share_of_a_selfdestructs_new_beneficiary_has_its_own_entry() {
+    let (child, beneficiary) = (Address::repeat_byte(0xa1), Address::repeat_byte(0xe1));
+    // The child moves its 1 wei to an empty beneficiary.
+    let mut child_code = vec![op::PUSH20];
+    child_code.extend_from_slice(beneficiary.as_slice());
+    child_code.push(op::SELFDESTRUCT);
+    let mut segment = Vec::new();
+    call_all_gas(&mut segment, op::CALL, child);
+    let code = measure(&segment);
+    let extra = [(child, child_code, 1)];
+    let plain = run_shared(code.clone(), &extra, &[]);
+    let call_share = [(GasId::CallNewAccountStateLegacyShare, 25_000)];
+    assert_eq!(run_shared(code.clone(), &extra, &call_share), plain);
+    let shared =
+        run_shared(code, &extra, &[(GasId::SelfdestructNewAccountStateLegacyShare, 16_000)]);
+    assert_eq!(shared, plain + 16_000);
+}
+
 #[test]
 fn eip2780_authorization_charges_no_state_gas_without_eip8037() {
     let caller = Address::repeat_byte(0xbb);

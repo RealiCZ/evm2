@@ -130,7 +130,13 @@ fn load_acc_and_calc_gas<T: EvmTypesHost>(
         }
     }
     gas.spend(cost)?;
-    super::spend_state_reserve_first(gas, state, GasId::NewAccountState, new_account_state_gas)?;
+    super::spend_state_with_share_reserve_first(
+        gas,
+        state,
+        GasId::NewAccountState,
+        GasId::CallNewAccountStateLegacyShare,
+        new_account_state_gas,
+    )?;
 
     let mut gas_limit = if state.feature(EvmFeatures::EIP150) {
         let budget = super::gas_budget(gas, state, super::BudgetUse::Forward);
@@ -442,10 +448,11 @@ pub fn create_with<T: EvmTypesHost>(
         {
             charged_create_state_gas =
                 state_price(state, GasId::CreateState, StateGasSite::Account(destination))?;
-            super::spend_state_reserve_first(
+            super::spend_state_with_share_reserve_first(
                 gas,
                 state,
                 GasId::CreateState,
+                GasId::CreateStateLegacyShare,
                 charged_create_state_gas,
             )?;
         }
@@ -531,7 +538,13 @@ pub fn selfdestruct(cx: _, [target]: [Word]) -> Result {
     // new-account state gas from the reservoir.
     if should_charge_topup && cx.state.feature(EvmFeatures::EIP8037) {
         let price = state_price(cx.state, GasId::NewAccountState, StateGasSite::Account(target))?;
-        super::spend_state_reserve_first(cx.gas, cx.state, GasId::NewAccountState, price)?;
+        super::spend_state_with_share_reserve_first(
+            cx.gas,
+            cx.state,
+            GasId::NewAccountState,
+            GasId::SelfdestructNewAccountStateLegacyShare,
+            price,
+        )?;
     }
     if !res.previously_destroyed {
         cx.gas.record_refund(cx.state.gas_params().get(GasId::SelfdestructRefund) as i64);
