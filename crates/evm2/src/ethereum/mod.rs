@@ -1851,4 +1851,486 @@ mod tests {
             }
         }
     }
+
+    /// Every `Transaction` accessor of the envelope reads its transaction, for each kind.
+    #[test]
+    fn tx_envelope_accessors_read_the_transaction() {
+        use alloy_consensus::{TxEip1559, TxEip4844, TxEip7702};
+        use alloy_eips::{
+            eip2930::AccessListItem,
+            eip7702::{Authorization, SignedAuthorization},
+        };
+        let to = Address::with_last_byte(0xbb);
+        let list = AccessList(vec![AccessListItem {
+            address: to,
+            storage_keys: vec![B256::repeat_byte(2)],
+        }]);
+        let input = Bytes::from_static(&[1, 2, 3]);
+        let value = U256::from(11);
+        let auth = SignedAuthorization::new_unchecked(
+            Authorization { chain_id: U256::from(7), address: to, nonce: 1 },
+            0,
+            U256::from(1),
+            U256::from(1),
+        );
+        let create = TxLegacy {
+            chain_id: Some(7),
+            nonce: 3,
+            gas_price: 9,
+            gas_limit: 21_007,
+            to: TxKind::Create,
+            value,
+            input: input.clone(),
+        };
+        let envelopes = [
+            TxEnvelope::Legacy(create.clone()),
+            TxEnvelope::Legacy(TxLegacy { to: TxKind::Call(to), ..create }),
+            TxEnvelope::Eip2930(TxEip2930 {
+                chain_id: 7,
+                nonce: 3,
+                gas_price: 9,
+                gas_limit: 21_007,
+                to: TxKind::Call(to),
+                value,
+                access_list: list.clone(),
+                input: input.clone(),
+            }),
+            TxEnvelope::Eip1559(TxEip1559 {
+                chain_id: 7,
+                nonce: 3,
+                gas_limit: 21_007,
+                max_fee_per_gas: 13,
+                max_priority_fee_per_gas: 2,
+                to: TxKind::Call(to),
+                value,
+                access_list: list.clone(),
+                input: input.clone(),
+            }),
+            TxEnvelope::Eip4844(
+                TxEip4844 {
+                    chain_id: 7,
+                    nonce: 3,
+                    gas_limit: 21_007,
+                    max_fee_per_gas: 13,
+                    max_priority_fee_per_gas: 2,
+                    to,
+                    value,
+                    access_list: list.clone(),
+                    blob_versioned_hashes: vec![B256::repeat_byte(1)],
+                    max_fee_per_blob_gas: 5,
+                    input: input.clone(),
+                }
+                .into(),
+            ),
+            TxEnvelope::from(TxEip7702 {
+                chain_id: 7,
+                nonce: 3,
+                gas_limit: 21_007,
+                max_fee_per_gas: 13,
+                max_priority_fee_per_gas: 2,
+                to,
+                value,
+                access_list: list.clone(),
+                authorization_list: vec![auth.clone()],
+                input: input.clone(),
+            }),
+        ];
+        for (i, tx) in envelopes.iter().enumerate() {
+            let legacy = matches!(tx, TxEnvelope::Legacy(_) | TxEnvelope::Eip2930(_));
+            assert_eq!(Transaction::chain_id(tx), Some(7), "{i}");
+            assert_eq!(Transaction::nonce(tx), 3, "{i}");
+            assert_eq!(Transaction::gas_limit(tx), 21_007, "{i}");
+            assert_eq!(Transaction::gas_price(tx), legacy.then_some(9), "{i}");
+            assert_eq!(Transaction::max_fee_per_gas(tx), if legacy { 9 } else { 13 }, "{i}");
+            assert_eq!(Transaction::max_priority_fee_per_gas(tx), (!legacy).then_some(2), "{i}");
+            let blob = matches!(tx, TxEnvelope::Eip4844(_));
+            assert_eq!(Transaction::max_fee_per_blob_gas(tx), blob.then_some(5), "{i}");
+            assert_eq!(Transaction::priority_fee_or_price(tx), if legacy { 9 } else { 2 }, "{i}");
+            assert_eq!(Transaction::effective_gas_price(tx, Some(1)), if legacy { 9 } else { 3 });
+            assert_eq!(Transaction::is_dynamic_fee(tx), !legacy, "{i}");
+            let kind = if i == 0 { TxKind::Create } else { TxKind::Call(to) };
+            assert_eq!(Transaction::kind(tx), kind, "{i}");
+            assert_eq!(Transaction::is_create(tx), i == 0, "{i}");
+            assert_eq!(Transaction::value(tx), value, "{i}");
+            assert_eq!(Transaction::input(tx), &input, "{i}");
+            let has_list = !matches!(tx, TxEnvelope::Legacy(_));
+            assert_eq!(Transaction::access_list(tx), has_list.then_some(&list), "{i}");
+            let hashes = [B256::repeat_byte(1)];
+            assert_eq!(Transaction::blob_versioned_hashes(tx), blob.then_some(&hashes[..]), "{i}");
+            let auths = [auth.clone()];
+            let set_code = matches!(tx, TxEnvelope::Eip7702(_));
+            assert_eq!(Transaction::authorization_list(tx), set_code.then_some(&auths[..]), "{i}");
+        }
+    }
+
+    /// The validation bounds take the limit itself: a gas limit at the block's, an execution
+    /// requirement at the cap and initcode at the size limit pass, one more fails.
+    #[test]
+    fn validation_bounds_admit_the_limit_itself() {
+        let prague = Version::new(SpecId::PRAGUE);
+        assert_eq!(validate_block_gas_limit(&prague, 1, U256::ONE), Ok(()));
+
+        let amsterdam = Version::new(SpecId::AMSTERDAM);
+        let (_, cap) = amsterdam.tx_gas_caps();
+        // A gas limit at the execution cap is not checked further.
+        assert_eq!(validate_execution_gas_limit_cap(&amsterdam, cap, cap + 1, 0), Ok(()));
+        assert_eq!(validate_execution_gas_limit_cap(&amsterdam, cap + 1, cap, 0), Ok(()));
+        let over = Err(HandlerError::IntrinsicGasGreaterThanCap { required: cap + 1, cap });
+        assert_eq!(validate_execution_gas_limit_cap(&amsterdam, cap + 1, cap + 1, 0), over);
+        assert_eq!(validate_execution_gas_limit_cap(&amsterdam, cap + 1, 0, cap + 1), over);
+
+        let shanghai = Version::new(SpecId::SHANGHAI);
+        let max = shanghai.max_initcode_size;
+        let code = |len: usize| Bytes::from(vec![0u8; len]);
+        assert_eq!(validate_create_initcode(&shanghai, TxKind::Create, &code(max)), Ok(()));
+        assert_eq!(
+            validate_create_initcode(&shanghai, TxKind::Create, &code(max + 1)),
+            Err(HandlerError::CreateInitCodeSizeLimit { limit: max, got: max + 1 })
+        );
+        let call = TxKind::Call(Address::ZERO);
+        assert_eq!(validate_create_initcode(&shanghai, call, &code(max + 1)), Ok(()));
+    }
+
+    #[test]
+    fn access_list_counts_count_accounts_and_keys() {
+        use alloy_eips::eip2930::AccessListItem;
+        let item = |byte, keys: usize| AccessListItem {
+            address: Address::with_last_byte(byte),
+            storage_keys: vec![B256::ZERO; keys],
+        };
+        assert_eq!(access_list_counts(&AccessList(vec![item(1, 2), item(2, 1)])), (2, 3));
+    }
+
+    /// The upfront state gas is taken from the reservoir first and spills into the execution gas.
+    #[test]
+    fn initial_state_gas_draws_the_reservoir_first() {
+        let mut version = Version::new(SpecId::AMSTERDAM);
+        version.tx_gas_limit_cap = 100_000;
+        // 101,000 less 21,000 of intrinsic gas: 79,000 of execution gas and 1,000 of reservoir.
+        assert_eq!(initial_gas_and_reservoir(&version, 101_000, 21_000, 0), (79_000, 1_000));
+        assert_eq!(initial_gas_and_reservoir(&version, 101_000, 21_000, 400), (79_000, 600));
+        assert_eq!(initial_gas_and_reservoir(&version, 101_000, 21_000, 1_500), (78_500, 0));
+    }
+
+    fn evm_with(
+        spec: SpecId,
+        version: Version,
+        database: InMemoryDB,
+    ) -> Evm<'static, BaseEvmTypes> {
+        let block =
+            BlockEnvExt { beneficiary: Address::with_last_byte(0xcc), ..Default::default() };
+        Evm::<BaseEvmTypes>::new_with_execution_config(
+            ExecutionConfig::for_spec_and_version(spec, version),
+            spec,
+            block,
+            ethereum_tx_registry(spec),
+            database,
+            Precompiles::base(spec),
+        )
+    }
+
+    /// EIP-3607 refuses a sender with code but not one with an EIP-7702 delegation; a top-up
+    /// raises a short balance to the upfront charge.
+    #[test]
+    fn sender_validation_refuses_code_and_tops_up_the_shortfall() {
+        let caller = Address::with_last_byte(0xaa);
+        let sender = |code: Option<Bytecode>, balance: u64| {
+            let mut database = InMemoryDB::default();
+            let mut info = AccountInfo::default().with_balance(U256::from(balance));
+            if let Some(code) = code {
+                info = info.with_code(code);
+            }
+            database.insert_account_info(&caller, info);
+            database
+        };
+        let prague = |database| evm_with(SpecId::PRAGUE, Version::new(SpecId::PRAGUE), database);
+        let code = crate::test_utils::legacy_bytecode([op::STOP]);
+        let mut evm = prague(sender(Some(code), 10));
+        assert_eq!(
+            validate_sender_and_bump_nonce(&mut evm, caller, 0, U256::ZERO),
+            Err(HandlerError::RejectCallerWithCode)
+        );
+        let delegation = Bytecode::new_eip7702(Address::with_last_byte(0xdd));
+        let mut evm = prague(sender(Some(delegation), 10));
+        assert_eq!(validate_sender_and_bump_nonce(&mut evm, caller, 0, U256::ZERO), Ok(0));
+        let mut evm = prague(sender(None, 10));
+        assert_eq!(validate_sender_and_bump_nonce(&mut evm, caller, 0, U256::ZERO), Ok(0));
+
+        let mut version = Version::new(SpecId::PRAGUE);
+        version.features.remove(EvmFeatures::BALANCE_CHECK);
+        version.features.insert(EvmFeatures::BALANCE_TOP_UP);
+        let mut evm = evm_with(SpecId::PRAGUE, version, sender(None, 3));
+        assert_eq!(validate_sender_and_bump_nonce(&mut evm, caller, 0, U256::from(10)), Ok(0));
+        assert_eq!(evm.state.account(&caller).unwrap().balance(), U256::from(10));
+    }
+
+    #[test]
+    fn base_accounts_and_the_access_list_are_warmed() {
+        use alloy_eips::eip2930::AccessListItem;
+        let mut evm = evm_with(SpecId::PRAGUE, Version::new(SpecId::PRAGUE), InMemoryDB::default());
+        let to = Address::with_last_byte(0xbb);
+        warm_base_accounts(&mut evm, TxKind::Call(to));
+        assert!(evm.state.prewarm_set().is_warm(&to));
+        assert!(evm.state.prewarm_set().is_warm(&Address::with_last_byte(0xcc)));
+        let listed = Address::with_last_byte(0xee);
+        let key = B256::repeat_byte(3);
+        let list = AccessList(vec![AccessListItem { address: listed, storage_keys: vec![key] }]);
+        warm_access_list(&mut evm, &list);
+        assert!(evm.state.prewarm_set().is_storage_warm(&listed, &b256_to_word(key)));
+    }
+
+    /// A first frame that halts gets back the part of its upfront charge the reservoir paid, and
+    /// the part execution gas paid is consumed with it, off the state gas spent.
+    #[test]
+    fn a_halted_first_frame_consumes_the_execution_paid_part_of_its_charge() {
+        let mut tx_gas = GasTracker::new_with_execution_gas_and_reservoir(100_000, 150_000);
+        tx_gas.spend_state(180_000).unwrap();
+        let mut result = MessageResultExt::<()> {
+            stop: InstrStop::InvalidFEOpcode,
+            gas: GasTracker::new_spent_with_reservoir(70_000, 0),
+            ..MessageResultExt::default()
+        };
+        settle_initial_frame_gas_into_reservoir(&mut tx_gas, &mut result, 180_000, 150_000);
+        assert_eq!(
+            (tx_gas.remaining(), tx_gas.reservoir(), tx_gas.state_gas_spent()),
+            (0, 150_000, 0)
+        );
+    }
+
+    /// A creation transaction that deploys keeps its account's state gas, under either give-back
+    /// rule; one onto an address that already holds a balance creates no account and is charged
+    /// none.
+    #[test]
+    fn a_deploying_creation_transaction_keeps_its_account_charge() {
+        let caller = Address::with_last_byte(0xaa);
+        for (refills, funded) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut version = Version::new(SpecId::AMSTERDAM);
+            version.features.set(EvmFeatures::EIP8037_RESERVOIR_REFILLS, refills);
+            let price = version.gas_params.get(GasId::CreateState);
+            let mut database = InMemoryDB::default();
+            database.insert_account_info(
+                &caller,
+                AccountInfo::default().with_balance(U256::from(u64::MAX)),
+            );
+            if funded {
+                database.insert_account_info(
+                    &caller.create(0),
+                    AccountInfo::default().with_balance(U256::from(1)),
+                );
+            }
+            let mut evm = evm_with(SpecId::AMSTERDAM, version, database);
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    gas_limit: 1_000_000,
+                    to: TxKind::Create,
+                    input: vec![op::PUSH0, op::PUSH0, op::RETURN].into(),
+                    ..Default::default()
+                }),
+                caller,
+            );
+            let result = evm.transact(&tx).unwrap().discard();
+            let case = format!("refills={refills} funded={funded}");
+            assert!(result.is_success(), "{case}");
+            assert_eq!(result.state_gas_spent(), if funded { 0 } else { price }, "{case}");
+        }
+    }
+
+    /// Clearing a slot set before the transaction refunds 4,800, which the result reports.
+    #[test]
+    fn the_result_reports_the_refund() {
+        let caller = Address::with_last_byte(0xaa);
+        let target = Address::with_last_byte(0xbb);
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &caller,
+            AccountInfo::default().with_balance(U256::from(u64::MAX)),
+        );
+        database.insert_account_info(
+            &target,
+            AccountInfo::default().with_nonce(1).with_code(crate::test_utils::legacy_bytecode([
+                op::PUSH0,
+                op::PUSH0,
+                op::SSTORE,
+            ])),
+        );
+        database.insert_account_storage(&target, &U256::ZERO, &U256::from(1));
+        let mut evm = evm_with(SpecId::PRAGUE, Version::new(SpecId::PRAGUE), database);
+        let tx = Recovered::new_unchecked(
+            TxEnvelope::Legacy(TxLegacy {
+                gas_limit: 100_000,
+                to: TxKind::Call(target),
+                ..Default::default()
+            }),
+            caller,
+        );
+        let result = evm.transact(&tx).unwrap().discard();
+        assert!(result.is_success());
+        assert_eq!(result.refunded, 4_800);
+    }
+
+    fn delegated_world() -> InMemoryDB {
+        let mut database = InMemoryDB::default();
+        database.insert_account_info(
+            &Address::with_last_byte(0xaa),
+            AccountInfo::default().with_balance(U256::from(u64::MAX)),
+        );
+        let stop = crate::test_utils::legacy_bytecode([op::STOP]);
+        database.insert_account_info(
+            &Address::with_last_byte(0xbb),
+            AccountInfo::default().with_code(Bytecode::new_eip7702(Address::with_last_byte(0xdd))),
+        );
+        database.insert_account_info(
+            &Address::with_last_byte(0xbc),
+            AccountInfo::default().with_nonce(1).with_code(stop.clone()),
+        );
+        database.insert_account_info(
+            &Address::with_last_byte(0xdd),
+            AccountInfo::default().with_nonce(1).with_code(stop),
+        );
+        database
+    }
+
+    fn run_delegated(to: u8, list: AccessList, gas_limit: u64) -> TxResult<BaseEvmTypes> {
+        let version = Version::new(SpecId::AMSTERDAM);
+        let mut evm = evm_with(SpecId::AMSTERDAM, version, delegated_world());
+        let tx = Recovered::new_unchecked(
+            TxEnvelope::Eip2930(TxEip2930 {
+                chain_id: 1,
+                gas_limit,
+                to: TxKind::Call(Address::with_last_byte(to)),
+                access_list: list,
+                ..Default::default()
+            }),
+            Address::with_last_byte(0xaa),
+        );
+        evm.transact(&tx).unwrap().discard()
+    }
+
+    /// Under EIP-2780 a call to an EIP-7702 delegated account reads its delegate: warm, a
+    /// delegate in the access list costs the warm read alone; cold, its load is made when the gas
+    /// left after the warm read covers the cold premium, exactly or more, and not otherwise.
+    #[test]
+    fn a_delegated_recipient_reads_its_delegate_warm_or_cold() {
+        use alloy_eips::eip2930::AccessListItem;
+        let listed = AccessList(vec![AccessListItem {
+            address: Address::with_last_byte(0xdd),
+            storage_keys: vec![],
+        }]);
+        let delegated = run_delegated(0xbb, listed.clone(), 1_000_000);
+        let plain = run_delegated(0xbc, listed, 1_000_000);
+        assert!(delegated.is_success() && plain.is_success());
+        assert_eq!(delegated.tx_gas_used() - plain.tx_gas_used(), 100);
+
+        let premium = Version::new(SpecId::AMSTERDAM).gas_params.cold_account_additional_cost();
+        let cold = run_delegated(0xbb, AccessList::default(), 1_000_000);
+        let plain = run_delegated(0xbc, AccessList::default(), 1_000_000);
+        assert!(cold.is_success());
+        assert_eq!(cold.tx_gas_used() - plain.tx_gas_used(), 100 + premium);
+        // The gas the cold read leaves at zero: the delegate is loaded and runs; one less, and the
+        // premium cannot be paid.
+        let used = cold.tx_gas_used();
+        assert!(run_delegated(0xbb, AccessList::default(), used).is_success());
+        assert!(!run_delegated(0xbb, AccessList::default(), used - 1).is_success());
+    }
+
+    /// A first frame that runs out of gas in the runtime gas phase is reported with the message
+    /// it would have run: its kind, depth, budget and reservoir, accounts, input and value.
+    #[test]
+    fn a_runtime_out_of_gas_first_frame_reports_its_message() {
+        use crate::{
+            Inspector,
+            interpreter::{Interpreter, Message, MessageResult},
+        };
+        type Seen = (MessageKind, u16, u64, u64, Address, Address, Address, Bytes, U256, Address);
+        #[derive(Default)]
+        struct Recorder(Vec<Seen>);
+        impl Recorder {
+            fn see(
+                &mut self,
+                interp: &Interpreter<'_, '_, BaseEvmTypes>,
+                m: &Message<BaseEvmTypes>,
+            ) {
+                self.0.push((
+                    m.kind,
+                    m.depth,
+                    m.gas_limit,
+                    m.reservoir,
+                    m.destination,
+                    m.call_target,
+                    m.caller,
+                    m.input.to_bytes(interp.memory()),
+                    m.value,
+                    m.code_address,
+                ));
+            }
+        }
+        impl Inspector<BaseEvmTypes> for Recorder {
+            fn call(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                m: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.see(interp, m);
+                None
+            }
+            fn create(
+                &mut self,
+                interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+                m: &mut Message<BaseEvmTypes>,
+            ) -> Option<MessageResult<BaseEvmTypes>> {
+                self.see(interp, m);
+                None
+            }
+        }
+        let caller = Address::with_last_byte(0xaa);
+        let empty = Address::with_last_byte(0xee);
+        for to in [TxKind::Create, TxKind::Call(empty)] {
+            let mut version = Version::new(SpecId::AMSTERDAM);
+            version.tx_gas_limit_cap = 100_000;
+            let mut database = InMemoryDB::default();
+            database.insert_account_info(
+                &caller,
+                AccountInfo::default().with_balance(U256::from(u64::MAX)),
+            );
+            let mut evm = evm_with(SpecId::AMSTERDAM, version, database);
+            evm.set_initial_call_depth(2);
+            evm.set_inspector(Recorder::default());
+            let input = Bytes::from_static(&[op::INVALID, 2]);
+            let tx = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    gas_limit: 150_000,
+                    to,
+                    value: U256::from(5),
+                    input: input.clone(),
+                    ..Default::default()
+                }),
+                caller,
+            );
+            let result = evm.transact(&tx).unwrap().discard();
+            assert_eq!(result.stop, InstrStop::OutOfGas, "{to:?}");
+            let seen = &evm.inspector().unwrap().downcast_ref::<Recorder>().unwrap().0;
+            // The execution cap less the intrinsic gas (the two nonzero calldata bytes' 32, and a
+            // creation's 3,000 and initcode word), and the 50,000 above the cap as the reservoir.
+            let (kind, budget, destination) = match to {
+                TxKind::Create => (MessageKind::Create, 100_000 - 24_034, caller.create(0)),
+                TxKind::Call(to) => (MessageKind::Call, 100_000 - 21_032, to),
+            };
+            assert_eq!(
+                seen[..],
+                [(
+                    kind,
+                    2,
+                    budget,
+                    50_000,
+                    destination,
+                    destination,
+                    caller,
+                    input,
+                    U256::from(5),
+                    destination
+                )],
+                "{to:?}"
+            );
+        }
+    }
 }
