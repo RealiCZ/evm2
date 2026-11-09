@@ -160,7 +160,8 @@ pub struct GasTracker {
     ///
     /// Under the reservoir-only rule ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]) nothing gives
     /// it back: it counts every state charge the frame, and every child that returned to it, paid
-    /// from execution gas, whatever the child ended with.
+    /// from execution gas (a legacy share included, [`Self::spend_state_with_share`]), whatever
+    /// the child ended with.
     ///
     /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
     state_gas_spilled: u64,
@@ -408,6 +409,27 @@ impl GasTracker {
         self.add_state_gas_spent(cost as i64);
         self.add_state_gas_spilled(spill);
         self.reservoir = 0;
+        Ok(())
+    }
+
+    /// Spends `cost` of state gas whose legacy share, `share` capped at `cost`, execution gas pays
+    /// before the reservoir; the rest is paid as [`Self::spend_state`] pays it, the reservoir
+    /// first and its shortfall from execution gas.
+    ///
+    /// The share and the shortfall are one execution-gas charge: when `remaining` cannot pay both
+    /// the charge fails, whatever the reservoir holds, and the reservoir and the state-gas
+    /// counters are left as they were. Both count as state gas, and both as
+    /// `state_gas_spilled`. With a zero share this is [`Self::spend_state`].
+    #[inline]
+    pub fn spend_state_with_share(&mut self, cost: u64, share: u64) -> Result {
+        let share = if share < cost { share } else { cost };
+        let rest = cost - share;
+        let from_reservoir = if rest < self.reservoir { rest } else { self.reservoir };
+        let from_remaining = cost - from_reservoir;
+        self.spend(from_remaining)?;
+        self.reservoir -= from_reservoir;
+        self.add_state_gas_spent(cost as i64);
+        self.add_state_gas_spilled(from_remaining);
         Ok(())
     }
 
@@ -879,6 +901,13 @@ impl Gas {
         self.tracker.spend_state(cost)
     }
 
+    /// Spends state gas whose legacy share execution gas pays first.
+    /// See [`GasTracker::spend_state_with_share`].
+    #[inline]
+    pub fn spend_state_with_share(&mut self, cost: u64, share: u64) -> Result {
+        self.tracker.spend_state_with_share(cost, share)
+    }
+
     /// Refills the reservoir with state gas returned by 0→x→0 storage
     /// restoration (EIP-8037). See [`GasTracker::refill_reservoir`].
     #[inline]
@@ -1229,6 +1258,44 @@ mod tests {
         assert_eq!(parent.reservoir(), 0);
         assert_eq!(parent.state_gas_spent(), 0);
         assert_eq!(parent.state_gas_spilled(), 0);
+    }
+
+    #[test]
+    fn test_spend_state_with_share_takes_the_share_first() {
+        // The share from execution gas, the rest from the reservoir.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 500);
+        gas.spend_state_with_share(300, 100).unwrap();
+        assert_eq!(
+            (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
+            (300, 900, 300, 100)
+        );
+
+        // A share above the charge is the whole charge.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 500);
+        gas.spend_state_with_share(50, 100).unwrap();
+        assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (500, 950, 50));
+
+        // A short reservoir: the share and the shortfall both from execution gas.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 100);
+        gas.spend_state_with_share(300, 100).unwrap();
+        assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (0, 800, 200));
+
+        // Execution gas that cannot pay the share fails the charge, whatever the reservoir holds.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(50, 10_000);
+        assert_matches!(gas.spend_state_with_share(300, 100), Err(InstrStop::OutOfGas));
+        assert_eq!(
+            (gas.reservoir(), gas.state_gas_spent(), gas.state_gas_spilled()),
+            (10_000, 0, 0)
+        );
+        assert_eq!(gas.failed_charge(), Some((50, 100)));
+
+        // With no share it is `spend_state`.
+        for (remaining, reservoir, cost) in [(1_000, 500, 300), (1_000, 100, 300), (0, 300, 300)] {
+            let mut shared = GasTracker::new_with_execution_gas_and_reservoir(remaining, reservoir);
+            let mut plain = shared;
+            assert_eq!(shared.spend_state_with_share(cost, 0), plain.spend_state(cost));
+            assert_eq!(shared, plain);
+        }
     }
 
     #[test]

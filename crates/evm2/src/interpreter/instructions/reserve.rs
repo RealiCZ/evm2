@@ -3,9 +3,10 @@
 //! A type family may hold part of a frame's execution gas outside `remaining`, as a reserve the
 //! frame cannot spend on its own execution. The interpreter's budget decisions see it (through
 //! [`gas_budget`]), and the deductions that are not the frame's own execution draw it first: the
-//! gas a call or creation forwards ([`spend_reserve_first`]) and a state-gas charge spilling past
-//! the reservoir ([`spend_state_reserve_first`]). The defaults hold no reserve, so these helpers
-//! compile to the stock code.
+//! gas a call or creation forwards ([`spend_reserve_first`]) and the part of a state-gas charge
+//! execution gas pays, its legacy share and its spill past the reservoir
+//! ([`spend_state_reserve_first`], [`spend_state_with_share_reserve_first`]). The defaults hold no
+//! reserve, so these helpers compile to the stock code.
 //!
 //! The seam is interpreter-only: the JIT builtins read `remaining` alone and never consult it.
 
@@ -74,6 +75,23 @@ pub fn spend_state_reserve_first<T: EvmTypesHost>(
     cost: u64,
 ) -> Result {
     spend_state_reserve_first_on::<T>(gas, state.host(), id, cost)
+}
+
+/// Charges `cost` of state gas `id` whose legacy share is the gas parameter `share`
+/// ([`Gas::spend_state_with_share`]): the share, and the part the reservoir cannot pay, are the
+/// execution gas the charge takes, which draws the reserve first.
+#[inline(always)]
+pub fn spend_state_with_share_reserve_first<T: EvmTypesHost>(
+    gas: &mut Gas,
+    state: &mut InterpreterState<'_, '_, T>,
+    id: GasId,
+    share: GasId,
+    cost: u64,
+) -> Result {
+    let share = cost.min(state.gas_params().get(share));
+    let from_remaining = share + (cost - share).saturating_sub(gas.reservoir());
+    draw_reserve::<T>(gas, state.host(), from_remaining, ReserveDraw::StateSpill(id));
+    gas.spend_state_with_share(cost, share)
 }
 
 /// [`spend_state_reserve_first`] outside an instruction, on the host directly.
