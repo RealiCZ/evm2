@@ -546,6 +546,10 @@ pub struct InitialFrame<T: EvmTypes> {
     /// account-creation charge), zero when nothing was charged. Refunded by
     /// [`settle_initial_frame_gas`] when the frame fails and the leaf is not created.
     pub charged_state_gas: u64,
+    /// The part of [`charged_state_gas`](Self::charged_state_gas) the reservoir paid: all the
+    /// reservoir-only rule ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]) gives back when the frame
+    /// halts.
+    pub charged_state_gas_from_reservoir: u64,
     /// Whether the runtime gas phase ran out of gas, so the frame halts without executing
     /// ([`execute_initial_frame`]). Its message then carries no resolved bytecode.
     pub runtime_oog: bool,
@@ -584,6 +588,7 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
     let halted =
         |host: &Evm<'a, T>| halted_initial_frame(host, caller, nonce, to, input, value, &budget);
     let mut charged_state_gas = 0;
+    let mut charged_state_gas_from_reservoir = 0;
     let message = match to {
         TxKind::Call(to) => {
             let (recipient_is_empty, mut code) = {
@@ -596,10 +601,12 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
             if host.feature(EvmFeatures::EIP2780) && !value.is_zero() && recipient_is_empty {
                 let new_account_state_gas =
                     T::state_gas_price(host, GasId::NewAccountState, StateGasSite::Account(to))?;
+                let from_reservoir = new_account_state_gas.min(tx_gas.reservoir());
                 if tx_gas.spend_state(new_account_state_gas).is_err() {
                     return Ok(halted(host));
                 }
                 charged_state_gas = new_account_state_gas;
+                charged_state_gas_from_reservoir = from_reservoir;
             }
             // An empty recipient is never delegated, so the charge above and the resolution below
             // are mutually exclusive.
@@ -663,10 +670,12 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
                         GasId::CreateState,
                         StateGasSite::Account(destination),
                     )?;
+                    let from_reservoir = create_state_gas.min(tx_gas.reservoir());
                     if tx_gas.spend_state(create_state_gas).is_err() {
                         return Ok(halted(host));
                     }
                     charged_state_gas = create_state_gas;
+                    charged_state_gas_from_reservoir = from_reservoir;
                 }
             }
             MessageExt {
@@ -689,7 +698,12 @@ pub fn prepare_initial_frame<'a, T: EvmTypes>(
         }
     };
     debug_assert_eq!(message.depth, host.version().initial_call_depth);
-    Ok(InitialFrame { message, charged_state_gas, runtime_oog: false })
+    Ok(InitialFrame {
+        message,
+        charged_state_gas,
+        charged_state_gas_from_reservoir,
+        runtime_oog: false,
+    })
 }
 
 /// Builds the first frame of a transaction whose runtime gas phase ran out of gas.
@@ -726,7 +740,12 @@ pub fn halted_initial_frame<T: EvmTypes>(
         salt: B256::ZERO,
         ..MessageExt::default()
     };
-    InitialFrame { message, charged_state_gas: 0, runtime_oog: true }
+    InitialFrame {
+        message,
+        charged_state_gas: 0,
+        charged_state_gas_from_reservoir: 0,
+        runtime_oog: true,
+    }
 }
 
 /// Settles the first frame's result into the transaction-level `tx_gas` and writes the settled
@@ -756,6 +775,36 @@ pub const fn settle_initial_frame_gas<E>(
     result.gas = *tx_gas;
 }
 
+/// [`settle_initial_frame_gas`] under the reservoir-only rule
+/// ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]).
+///
+/// The frame's settled gas is merged by [`GasTracker::merge_child_gas_into_reservoir`]. When the
+/// frame did not create the account leaf the runtime gas phase charged for, the charge is given
+/// back into the reservoir ([`GasTracker::refill_reservoir_only`]): all of it when the frame
+/// reverted, and only `charged_state_gas_from_reservoir`, the part the reservoir paid, when it
+/// halted. The part execution gas paid is then consumed with the halted frame's execution gas:
+/// nothing of it returns to the sender, and it leaves the state gas spent, as a halted frame's own
+/// state charges do.
+pub const fn settle_initial_frame_gas_into_reservoir<E>(
+    tx_gas: &mut GasTracker,
+    result: &mut MessageResultExt<E>,
+    charged_state_gas: u64,
+    charged_state_gas_from_reservoir: u64,
+) {
+    tx_gas.spend_all();
+    tx_gas.merge_child_gas_into_reservoir(result.gas, result.stop);
+    if charged_state_gas != 0 && !result.is_success() {
+        if result.stop.is_halt() {
+            tx_gas.refill_reservoir_only(charged_state_gas_from_reservoir);
+            let consumed = charged_state_gas - charged_state_gas_from_reservoir;
+            tx_gas.add_state_gas_spent(-(consumed as i64));
+        } else {
+            tx_gas.refill_reservoir_only(charged_state_gas);
+        }
+    }
+    result.gas = *tx_gas;
+}
+
 /// Executes the prepared first frame and settles its gas into the transaction-level tracker.
 ///
 /// A frame whose runtime gas phase ran out of gas ([`InitialFrame::runtime_oog`]) is halted
@@ -767,7 +816,12 @@ pub fn execute_initial_frame<T: EvmTypes>(
     execution_gas_limit: u64,
     reservoir: u64,
 ) -> Result<MessageResult<T>, crate::ExecutionError> {
-    let InitialFrame { mut message, charged_state_gas, runtime_oog } = frame;
+    let InitialFrame {
+        mut message,
+        charged_state_gas,
+        charged_state_gas_from_reservoir,
+        runtime_oog,
+    } = frame;
     if runtime_oog {
         // The hooks see the frame burn the budget it was given; the transaction itself burns all
         // its execution gas and returns the reservoir, dropping the phase's partial charges.
@@ -780,7 +834,16 @@ pub fn execute_initial_frame<T: EvmTypes>(
     // Failed execution has already been rolled back to the message's own checkpoint inside
     // `execute_message`; the settle merges the frame gas into the transaction-level gas.
     let mut result = host.execute_message(&mut message)?;
-    settle_initial_frame_gas(tx_gas, &mut result, charged_state_gas);
+    if host.feature(EvmFeatures::EIP8037_RESERVOIR_REFILLS) {
+        settle_initial_frame_gas_into_reservoir(
+            tx_gas,
+            &mut result,
+            charged_state_gas,
+            charged_state_gas_from_reservoir,
+        );
+    } else {
+        settle_initial_frame_gas(tx_gas, &mut result, charged_state_gas);
+    }
     Ok(result)
 }
 
