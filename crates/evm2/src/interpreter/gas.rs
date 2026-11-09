@@ -157,6 +157,12 @@ pub struct GasTracker {
     /// the spilled portion is credited back to `remaining` in last-in-first-out
     /// order by [`Self::rollback_state_gas`]; on success it is propagated to the
     /// parent frame so a later parent rollback can return it.
+    ///
+    /// Under the reservoir-only rule ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]) nothing gives
+    /// it back: it counts every state charge the frame, and every child that returned to it, paid
+    /// from execution gas, whatever the child ended with.
+    ///
+    /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
     state_gas_spilled: u64,
     refunded: i64,
     /// The gas a halt found: `[remaining, cost]` of the last execution-gas charge that failed,
@@ -465,6 +471,73 @@ impl GasTracker {
         self.state_gas_spilled -= to_remaining;
         self.reservoir = self.reservoir.saturating_add(amount - to_remaining);
         self.state_gas_spent = self.state_gas_spent.saturating_sub(amount as i64);
+    }
+
+    /// Gives `amount` of state gas back into the reservoir alone, the reservoir-only rule's refill
+    /// ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]).
+    ///
+    /// Whatever pool paid the charge, `remaining` does not rise: the execution gas a charge spilled
+    /// into stays spent, and its price waits in the reservoir for later state charges, or for the
+    /// end of the transaction. `state_gas_spent` falls by `amount` as for
+    /// [`Self::refill_reservoir`] and may become negative the same way; `state_gas_spilled` is
+    /// not lowered.
+    ///
+    /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
+    #[inline]
+    pub const fn refill_reservoir_only(&mut self, amount: u64) {
+        self.reservoir = self.reservoir.saturating_add(amount);
+        self.state_gas_spent = self.state_gas_spent.saturating_sub(amount as i64);
+    }
+
+    /// Settles this returning frame's own gas for its `stop` reason under the reservoir-only rule
+    /// ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]); `received_reservoir` is the reservoir the
+    /// frame started with.
+    ///
+    /// A frame that reverts gives its net state gas, the charges it and its successful children
+    /// made less the give-backs they received, back into its own reservoir, which becomes
+    /// `reservoir + state_gas_spent`; `remaining`, which none of it reaches, is returned as it is.
+    /// A frame that halts exceptionally gets back the reservoir it received and consumes
+    /// `remaining`, with the state gas that execution gas paid. Either drops the refund counter
+    /// and resets `state_gas_spent`; `state_gas_spilled` is kept for the caller to merge. On
+    /// success the gas is left as-is.
+    ///
+    /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
+    #[inline]
+    pub const fn settle_gas_into_reservoir(&mut self, stop: InstrStop, received_reservoir: u64) {
+        if stop.is_success() {
+            return;
+        }
+        if stop.is_halt() {
+            self.reservoir = received_reservoir;
+            self.set_remaining(0);
+        } else {
+            self.reservoir = self.reservoir.saturating_add_signed(self.state_gas_spent);
+        }
+        self.state_gas_spent = 0;
+        self.set_refunded(0);
+    }
+
+    /// Merges a returning child frame's (already
+    /// [settled](Self::settle_gas_into_reservoir)) gas into this frame under the reservoir-only
+    /// rule ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]).
+    ///
+    /// As [`Self::merge_child_gas`], but the child's reservoir becomes this frame's without
+    /// unwinding any state gas this frame paid from execution gas, and the child's
+    /// `state_gas_spilled` is merged whatever the child ended with: a failed child's spill stays
+    /// spent. The child's net state gas and refund counter merge on success only.
+    ///
+    /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
+    #[inline]
+    pub const fn merge_child_gas_into_reservoir(&mut self, child: Self, stop: InstrStop) {
+        if stop.is_success() || stop.is_frame_revert() {
+            self.erase_cost(child.remaining);
+        }
+        if stop.is_success() {
+            self.add_state_gas_spent(child.state_gas_spent);
+            self.record_refund(child.refunded);
+        }
+        self.add_state_gas_spilled(child.state_gas_spilled);
+        self.reservoir = child.reservoir;
     }
 
     /// Adds gas refund.
@@ -813,6 +886,12 @@ impl Gas {
         self.tracker.refill_reservoir(amount);
     }
 
+    /// Gives state gas back into the reservoir alone. See [`GasTracker::refill_reservoir_only`].
+    #[inline]
+    pub const fn refill_reservoir_only(&mut self, amount: u64) {
+        self.tracker.refill_reservoir_only(amount);
+    }
+
     /// Adds gas refund.
     #[inline]
     pub const fn record_refund(&mut self, refund: i64) {
@@ -830,6 +909,13 @@ impl Gas {
     #[inline]
     pub const fn merge_child_gas(&mut self, child: GasTracker, stop: InstrStop) {
         self.tracker.merge_child_gas(child, stop);
+    }
+
+    /// Merges a returning child frame's gas into this frame under the reservoir-only rule.
+    /// See [`GasTracker::merge_child_gas_into_reservoir`].
+    #[inline]
+    pub const fn merge_child_gas_into_reservoir(&mut self, child: GasTracker, stop: InstrStop) {
+        self.tracker.merge_child_gas_into_reservoir(child, stop);
     }
 
     /// Spends all remaining execution gas.
@@ -1143,6 +1229,124 @@ mod tests {
         assert_eq!(parent.reservoir(), 0);
         assert_eq!(parent.state_gas_spent(), 0);
         assert_eq!(parent.state_gas_spilled(), 0);
+    }
+
+    #[test]
+    fn test_refill_reservoir_only_leaves_remaining_and_spill() {
+        // 200 from the reservoir, 300 spilled into execution gas.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 200);
+        gas.spend_state(500).unwrap();
+        assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spilled()), (0, 700, 300));
+
+        // The whole price goes into the reservoir; the spilled execution gas stays spent.
+        gas.refill_reservoir_only(500);
+        assert_eq!(
+            (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
+            (500, 700, 0, 300)
+        );
+
+        // A refill of a charge another frame made drives the net negative.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 0);
+        gas.refill_reservoir_only(300);
+        assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (300, 1_000, -300));
+    }
+
+    #[test]
+    fn test_settle_gas_into_reservoir_by_stop() {
+        // Received 100 of reservoir; a charge of 150 takes it and spills 50.
+        let charged = || {
+            let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 100);
+            gas.spend_state(150).unwrap();
+            gas.record_refund(7);
+            gas
+        };
+
+        // A revert keeps the remaining gas and puts the whole charge into the reservoir.
+        let mut gas = charged();
+        gas.settle_gas_into_reservoir(InstrStop::Revert, 100);
+        assert_eq!(
+            (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
+            (150, 950, 0, 50)
+        );
+        assert_eq!(gas.refunded(), 0);
+
+        // A frame-revert stop that ran no frame is settled the same way.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 100);
+        gas.settle_gas_into_reservoir(InstrStop::OutOfFunds, 100);
+        assert_eq!((gas.reservoir(), gas.remaining()), (100, 1_000));
+
+        // A halt restores the reservoir received and consumes the remaining gas.
+        let mut gas = charged();
+        gas.settle_gas_into_reservoir(InstrStop::OutOfGas, 100);
+        assert_eq!(
+            (gas.reservoir(), gas.remaining(), gas.state_gas_spent(), gas.state_gas_spilled()),
+            (100, 0, 0, 50)
+        );
+        assert_eq!(gas.refunded(), 0);
+
+        // A success is left as it is.
+        let mut gas = charged();
+        let before = gas;
+        gas.settle_gas_into_reservoir(InstrStop::Stop, 100);
+        assert_eq!(gas, before);
+        assert_eq!(gas.refunded(), 7);
+
+        // A frame that took back more than it charged gives the excess up on a revert.
+        let mut gas = GasTracker::new_with_execution_gas_and_reservoir(1_000, 40);
+        gas.refill_reservoir_only(300);
+        gas.spend_state(100).unwrap();
+        gas.settle_gas_into_reservoir(InstrStop::Revert, 40);
+        assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (40, 1_000, 0));
+    }
+
+    #[test]
+    fn test_merge_child_gas_into_reservoir_never_unwinds() {
+        // The parent spilled 400 of state gas into its execution gas.
+        let parent = || {
+            let mut gas = GasTracker::from_parts(1_000, 600, 0);
+            gas.spend_state(400).unwrap();
+            gas
+        };
+        // A child that spilled 30 and returns 250 of reservoir and 80 of execution gas.
+        let child = || {
+            let mut gas = GasTracker::from_parts(100, 110, 250);
+            gas.spend_state(280).unwrap();
+            gas.record_refund(5);
+            gas
+        };
+        assert_eq!((child().reservoir(), child().remaining()), (0, 80));
+        let mut c = child();
+        c.set_reservoir(250);
+
+        let mut p = parent();
+        p.merge_child_gas_into_reservoir(c, InstrStop::Stop);
+        assert_eq!(
+            (p.reservoir(), p.remaining(), p.state_gas_spent(), p.state_gas_spilled()),
+            (250, 280, 680, 430)
+        );
+        assert_eq!(p.refunded(), 5);
+
+        // A reverted child returns its execution gas and reservoir; its spill stays spent.
+        let mut c = child();
+        c.settle_gas_into_reservoir(InstrStop::Revert, 250);
+        assert_eq!((c.reservoir(), c.remaining()), (280, 80));
+        let mut p = parent();
+        p.merge_child_gas_into_reservoir(c, InstrStop::Revert);
+        assert_eq!(
+            (p.reservoir(), p.remaining(), p.state_gas_spent(), p.state_gas_spilled()),
+            (280, 280, 400, 430)
+        );
+        assert_eq!(p.refunded(), 0);
+
+        // A halted child returns the reservoir it received and no execution gas.
+        let mut c = child();
+        c.settle_gas_into_reservoir(InstrStop::OutOfGas, 250);
+        let mut p = parent();
+        p.merge_child_gas_into_reservoir(c, InstrStop::OutOfGas);
+        assert_eq!(
+            (p.reservoir(), p.remaining(), p.state_gas_spent(), p.state_gas_spilled()),
+            (250, 200, 400, 430)
+        );
     }
 
     #[test]

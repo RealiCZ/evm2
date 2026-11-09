@@ -1369,7 +1369,11 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
         // rather than in each result builder, so every consumer (parent
         // `merge_child_gas`, top-level accounting, inspectors) reads the settled gas.
         T::MessageHooks::unsettled(self, message, &result);
-        result.gas.settle_gas(result.stop);
+        if self.feature(EvmFeatures::EIP8037_RESERVOIR_REFILLS) {
+            result.gas.settle_gas_into_reservoir(result.stop, message.reservoir);
+        } else {
+            result.gas.settle_gas(result.stop);
+        }
         T::MessageHooks::after(self, message, &mut result)?;
         Ok(result)
     }
@@ -1642,7 +1646,12 @@ impl<'a, T: EvmTypes> Evm<'a, T> {
                 );
                 stop = rejected;
                 output = refusal;
-                if stop == InstrStop::Revert {
+                // Under the reservoir-only rule the refused deposit's charges follow the revert:
+                // its settlement gives the state charges back into the reservoir, and the hashing
+                // stays spent.
+                if stop == InstrStop::Revert
+                    && !self.feature(EvmFeatures::EIP8037_RESERVOIR_REFILLS)
+                {
                     *gas.tracker_mut() = gas_before;
                 }
             }

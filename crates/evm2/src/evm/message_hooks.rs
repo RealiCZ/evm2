@@ -78,9 +78,14 @@ pub trait MessageHooks<T: EvmTypesHost>: 'static {
     /// Admits validated code after deposit charges, before installation and `before_commit`.
     ///
     /// `None` accepts; `Some((stop, output))` rejects with a non-success stop. `Revert` restores
-    /// `gas_before` (including hashing and state charges); other stops retain the charged gas
-    /// until ordinary settlement. Extra charges can be made through `gas`. `gas_before` is the
-    /// frame's gas before the deposit charges. Execution errors abort the transaction.
+    /// `gas_before` (including hashing and state charges), except under the reservoir-only rule
+    /// ([`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]), where the charges stay and the revert's
+    /// settlement gives the state charges back into the reservoir while the hashing stays spent;
+    /// other stops retain the charged gas until ordinary settlement. Extra charges can be made
+    /// through `gas`. `gas_before` is the frame's gas before the deposit charges. Execution errors
+    /// abort the transaction.
+    ///
+    /// [`EvmFeatures::EIP8037_RESERVOIR_REFILLS`]: crate::EvmFeatures::EIP8037_RESERVOIR_REFILLS
     ///
     /// # Panics
     ///
