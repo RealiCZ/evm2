@@ -1484,4 +1484,81 @@ mod tests {
         assert!(gas.try_spend_state(5).is_ok());
         assert_eq!((gas.reservoir(), gas.remaining(), gas.state_gas_spent()), (0, 0, 5));
     }
+
+    /// A hasher folding every byte it is given, so that two values hash alike only when they feed
+    /// the same bytes.
+    struct Fold(u64);
+
+    impl core::hash::Hasher for Fold {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            for b in bytes {
+                self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+
+    fn hash_of(gas: &GasTracker) -> u64 {
+        let mut h = Fold(0xcbf2_9ce4_8422_2325);
+        core::hash::Hash::hash(gas, &mut h);
+        core::hash::Hasher::finish(&h)
+    }
+
+    /// Equality and hashing read every counted field: a tracker that differs in one of them is
+    /// unequal and hashes apart; the halt record is left out of both.
+    #[test]
+    fn test_tracker_equality_and_hash_read_every_counted_field() {
+        let base = GasTracker::new_with_execution_gas_and_reservoir(100, 10);
+        let changes: [fn(&mut GasTracker); 6] = [
+            |g| g.set_remaining(90),
+            |g| g.set_limit(120),
+            |g| g.set_reservoir(4),
+            |g| g.add_state_gas_spent(3),
+            |g| g.add_state_gas_spilled(2),
+            |g| g.record_refund(1),
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let mut other = base;
+            change(&mut other);
+            assert_ne!(other, base, "change {i}");
+            assert_ne!(hash_of(&other), hash_of(&base), "change {i}");
+        }
+        let mut halted = base;
+        halted.record_failed_charge(100, 7);
+        assert_eq!(halted, base);
+        assert_eq!(hash_of(&halted), hash_of(&base));
+    }
+
+    #[test]
+    fn test_tracker_limit_spent_and_used_accessors() {
+        let mut gas = GasTracker::new(100);
+        gas.set_limit(150);
+        assert_eq!(gas.limit(), 150);
+        gas.set_spent(30);
+        assert_eq!((gas.remaining(), gas.spent()), (120, 30));
+        gas.record_refund(7);
+        assert_eq!(gas.used(), 23);
+    }
+
+    #[test]
+    fn test_gas_forwards_its_accessors_to_the_tracker() {
+        let mut gas = Gas::new(100);
+        gas.set_limit(150);
+        assert_eq!(gas.limit(), 150);
+        gas.set_reservoir(9);
+        assert_eq!(gas.reservoir(), 9);
+        gas.add_state_gas_spent(5);
+        assert_eq!(gas.state_gas_spent(), 5);
+        gas.add_state_gas_spilled(4);
+        assert_eq!(gas.state_gas_spilled(), 4);
+        gas.set_spent(30);
+        assert_eq!((gas.remaining(), gas.spent()), (120, 30));
+        gas.record_refund(7);
+        assert_eq!(gas.used(), 23);
+        gas.spend_all();
+        assert_eq!(gas.remaining(), 0);
+    }
 }
