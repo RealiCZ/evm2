@@ -303,13 +303,13 @@ pub fn call_with<T: EvmTypesHost>(
     if result.stop.is_fatal() {
         return Err(result.stop);
     }
-    gas.merge_child_gas(result.gas, result.stop);
+    super::merge_returned_gas(gas, state, result.gas, result.stop);
     // EIP-8037: a value-bearing CALL that creates the target charges NEW_ACCOUNT state
     // gas upfront on this frame. If the call does not succeed (depth/balance failure,
     // child revert or halt) the target is not created, so refund the upfront charge to
     // the reservoir (execution-specs `credit_state_gas_refund`), mirroring CREATE.
     if new_account_state_gas != 0 && !result.is_success() {
-        gas.refill_reservoir(new_account_state_gas);
+        super::give_back_state_gas(gas, state, new_account_state_gas);
     }
     after(gas, state, &message, &result)?;
     let copy_len = min(return_memory_range.len(), result.output.len());
@@ -482,7 +482,7 @@ pub fn create_with<T: EvmTypesHost>(
     if result.stop.is_fatal() {
         return Err(result.stop);
     }
-    gas.merge_child_gas(result.gas, result.stop);
+    super::merge_returned_gas(gas, state, result.gas, result.stop);
 
     // EIP-8037: when the opcode charged the conditional `create_state_gas`
     // and the create then fails to deploy (revert, halt, or an early-fail leaving
@@ -491,7 +491,7 @@ pub fn create_with<T: EvmTypesHost>(
     // restoration). A successful deployment keeps the charge; an alive target was never charged.
     let create_failed = result.created_address.is_none() || !result.is_success();
     if charged_create_state_gas != 0 && create_failed {
-        gas.refill_reservoir(charged_create_state_gas);
+        super::give_back_state_gas(gas, state, charged_create_state_gas);
     }
     after(gas, state, &message, &result)?;
     // EIP-211 exposes CREATE failure data only for REVERT; other failures clear returndata.
