@@ -1279,3 +1279,34 @@ mod before_initial_frame {
         assert!(authority.as_ref().is_none_or(|info| info.is_empty()), "{authority:?}");
     }
 }
+
+/// A value `CALL` to a new account that fails (the caller holds no balance) gives the new
+/// account's state gas back, and a `CREATE` keeps its account's state gas only when it deploys,
+/// under either give-back rule.
+#[test]
+fn eip8037_failed_call_and_creation_give_their_account_charges_back() {
+    let (parent, new) = (Address::repeat_byte(0x11), Address::repeat_byte(0xee));
+    // CALL(GAS, new, 1, 0, 0, 0, 0) from a contract without balance: out of funds.
+    let mut value_call = vec![op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH0, op::PUSH1, 1, op::PUSH20];
+    value_call.extend_from_slice(new.as_slice());
+    value_call.extend([op::GAS, op::CALL, op::POP, op::STOP]);
+    // CREATE(0, 29, 3) of `PUSH0; PUSH0; <end>`, stored at memory bytes 29..32.
+    let create = |end: u8| {
+        vec![op::PUSH3, op::PUSH0, op::PUSH0, end, op::PUSH0, op::MSTORE]
+            .into_iter()
+            .chain([op::PUSH1, 3, op::PUSH1, 29, op::PUSH0, op::CREATE, op::POP, op::STOP])
+            .collect::<Vec<u8>>()
+    };
+    for refills in [false, true] {
+        let version = state_gas_version(refills);
+        let create_price = version.gas_params.get(GasId::CreateState);
+        for (code, kept) in
+            [(value_call.clone(), 0), (create(op::REVERT), 0), (create(op::RETURN), create_price)]
+        {
+            let (database, tx) = contracts(Address::repeat_byte(0xcc), &[(parent, code.clone())]);
+            let result = run_with_version(&database, state_gas_version(refills), &tx);
+            assert!(result.is_success(), "refills={refills} {code:02x?}");
+            assert_eq!(result.state_gas_spent(), kept, "refills={refills} {code:02x?}");
+        }
+    }
+}
