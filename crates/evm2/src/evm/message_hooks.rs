@@ -26,20 +26,26 @@ use alloy_primitives::Bytes;
 /// [`Evm::message_input`](crate::Evm::message_input) reads the input in any of them. A clone of a
 /// range is only the range: a hook that keeps the bytes copies them.
 pub trait MessageHooks<T: EvmTypesHost>: 'static {
-    /// Whether [`Self::before`] runs.
+    /// Whether [`Self::before`] runs. Only the no-op `()` sets it, to `false`; no other family
+    /// sets it.
     ///
     /// `before` gets the message by `&mut` and may keep its input, and a kept range of the
     /// caller's memory reads whatever the caller writes there later, so the message path copies
     /// a call input that is such a range into owned bytes before it runs `before`; `before` and
-    /// every hook after it see the copy, and so does the callee. A family that does not override
-    /// `before` can set this to `false`: the path then skips both, and the input stays a range of
-    /// the caller's memory.
+    /// every hook after it see the copy, and so does the callee. The path reads this to skip both
+    /// for `()`, which runs no `before`, so the input stays a range of the caller's memory. A
+    /// family that set it to `false` and overrode `before` would never have its `before` called,
+    /// and nothing would catch it, so the constant is not part of the public contract.
+    #[doc(hidden)]
     const RUNS_BEFORE: bool = true;
 
     /// Runs before the message executes, before the call-depth check.
     ///
     /// Returning `Some(result)` answers the message without executing it; the result is settled
     /// for its stop like any other. The message's input owns its bytes.
+    ///
+    /// A family that overrides `before` leaves the hidden constant `RUNS_BEFORE` at its default,
+    /// `true`: with `false`, which only the no-op `()` sets, its `before` would never be called.
     #[inline]
     fn before(
         evm: &mut T::Host<'_>,
