@@ -20,20 +20,26 @@ use alloy_primitives::Bytes;
 /// transaction and roll back the message checkpoint. Consensus hooks do not run for inspector
 /// overrides.
 pub trait MessageHooks<T: EvmTypesHost>: 'static {
-    /// Whether [`Self::before`] runs.
+    /// Whether [`Self::before`] runs. Only the no-op `()` sets it, to `false`; no other family
+    /// sets it.
     ///
     /// `before` gets the message by `&mut` and may keep its input, so the message path copies a
-    /// call input that borrows the caller's memory before it runs `before`. A family that does
-    /// not override `before` can set this to `false`: the path then skips both, and the input
-    /// stays borrowed. That is sound because every other hook gets the message by shared
-    /// reference, which cannot move the input out; a hook that gets it by `&mut` must have the
-    /// input copied first, as `before` does.
+    /// call input that borrows the caller's memory before it runs `before`. The path reads this
+    /// to skip both for `()`, which runs no `before`, so the input stays borrowed. That is sound
+    /// because every other hook gets the message by shared reference, which cannot move the
+    /// input out; a hook that gets it by `&mut` must have the input copied first, as `before`
+    /// does. A family that set it to `false` and overrode `before` would never have its `before`
+    /// called, and nothing would catch it, so the constant is not part of the public contract.
+    #[doc(hidden)]
     const RUNS_BEFORE: bool = true;
 
     /// Runs before the message executes, before the call-depth check.
     ///
     /// Returning `Some(result)` answers the message without executing it; the result is settled
     /// for its stop like any other. The message's input owns its bytes.
+    ///
+    /// A family that overrides `before` leaves the hidden constant `RUNS_BEFORE` at its default,
+    /// `true`: with `false`, which only the no-op `()` sets, its `before` would never be called.
     #[inline]
     fn before(
         evm: &mut T::Host<'_>,

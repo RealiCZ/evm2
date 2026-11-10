@@ -565,8 +565,6 @@ mod nested_enter {
     /// it exits.
     struct Nester;
     impl MessageHooks<Types> for Nester {
-        const RUNS_BEFORE: bool = false;
-
         fn enter(evm: &mut Evm<'_, Types>, m: &Message<Types>) {
             if m.destination == CODE {
                 let mut nested: Message<Types> = MessageExt {
@@ -642,5 +640,158 @@ mod nested_enter {
         let result = Host::execute_message(&mut evm, &mut message).unwrap();
         assert_eq!(result.stop, InstrStop::Stop);
         assert_eq!(evm.ext().as_slice(), [Bytes::copy_from_slice(&input)]);
+    }
+}
+
+/// The no-op `()` runs no `before`, so the message path leaves a call's input borrowing the
+/// caller's memory; a family that keeps the defaults runs `before`, so the path copies the input
+/// first.
+mod input_copy {
+    use super::*;
+    use core::cell::RefCell;
+    use evm2::{
+        BaseEvmConfig, EvmConfig, OpcodeConfig,
+        evm::precompile::PrecompileOutput,
+        precompiles::{Precompile, PrecompileId, PrecompileResult},
+    };
+    use evm2_macros::instruction;
+
+    /// An opcode Osaka leaves free: notes the address of the caller's memory.
+    const NOTE_MEMORY: u8 = 0x0c;
+    /// A precompile that notes the address and the bytes of its input.
+    const NOTE_INPUT: Address = Address::with_last_byte(0xf0);
+
+    /// The addresses of the caller's memory and of the callee's input, and the input's bytes.
+    #[derive(Debug, Default)]
+    struct Seen {
+        memory: Option<usize>,
+        input: Option<usize>,
+        bytes: Option<Vec<u8>>,
+    }
+
+    std::thread_local! {
+        static SEEN: RefCell<Seen> = RefCell::default();
+    }
+
+    #[instruction]
+    fn note_memory(cx: _) {
+        let memory = cx.state.memory().as_slice().as_ptr() as usize;
+        SEEN.with_borrow_mut(|s| s.memory = Some(memory));
+    }
+
+    fn note_input<T: EvmTypesHost>(
+        _: &mut Evm<'_, T>,
+        m: &Message<T>,
+        _: &mut GasTracker,
+    ) -> PrecompileResult {
+        SEEN.with_borrow_mut(|s| {
+            (s.input, s.bytes) = (Some(m.input.as_ptr() as usize), Some(m.input.to_vec()))
+        });
+        Ok(PrecompileOutput::new(Bytes::new()))
+    }
+
+    /// Defines a type family `$name` with message hooks `$hooks` and its Osaka config `$config`,
+    /// with [`note_memory`] at [`NOTE_MEMORY`].
+    macro_rules! family {
+        ($name:ident, $config:ident, $hooks:ty) => {
+            struct $name;
+
+            impl EvmTypesHost for $name {
+                type ConfigSelector = BaseEvmConfigSelector;
+                type SpecId = SpecId;
+                type Tx = ();
+                type EvmExt = ();
+                type MessageExt = ();
+                type MessageResultExt = ();
+                type TxEnvExt = ();
+                type TxResultExt = ();
+                type BlockEnvExt = ();
+                type Host<'a> = Evm<'a, Self>;
+                type MessageHooks = $hooks;
+            }
+
+            struct $config;
+
+            impl EvmConfig<$name> for $config {
+                const BASE_SPEC_ID: SpecId = SpecId::OSAKA;
+                const OPCODE_CONFIG: &'static OpcodeConfig<$name> = &{
+                    let mut config =
+                        OpcodeConfig::<$name>::base::<BaseEvmConfig<{ SpecId::OSAKA as u32 }>>();
+                    config.set_instruction::<note_memory<$name>>(NOTE_MEMORY, 2);
+                    config
+                };
+            }
+        };
+    }
+
+    /// Keeps every default, `RUNS_BEFORE` and `before` alike.
+    struct Defaults;
+    impl<T: EvmTypesHost> MessageHooks<T> for Defaults {}
+
+    family!(NoOp, NoOpConfig, ());
+    family!(Defaulted, DefaultedConfig, Defaults);
+
+    /// Runs, on family `T` with config `C`, a caller that stores `0xaa` at memory 0, notes its
+    /// memory and calls [`NOTE_INPUT`] with memory 0..32 as the input, and returns what was seen.
+    fn run<T, C>() -> Seen
+    where
+        T: evm2::EvmTypes<SpecId = SpecId, EvmExt = (), BlockEnvExt = (), MessageExt = ()>,
+        C: EvmConfig<T>,
+    {
+        // MSTORE8(0, 0xaa); NOTE_MEMORY; CALL(gas, NOTE_INPUT, 0, 0, 32, 0, 0): 15 bytes, so the
+        // jump analysis takes its scalar path, which Miri can run. No memory grows after the note.
+        let mut parent = vec![op::PUSH1, 0xaa, op::PUSH0, op::MSTORE8, NOTE_MEMORY];
+        parent.extend([op::PUSH0, op::PUSH0, op::PUSH1, 32, op::PUSH0, op::PUSH0]);
+        parent.extend([op::PUSH1, NOTE_INPUT[19], op::GAS, op::CALL]);
+        let mut precompiles = Precompiles::base(SpecId::OSAKA);
+        precompiles.as_map_mut().insert(Precompile::new(
+            NOTE_INPUT,
+            PrecompileId::custom("note-input"),
+            note_input::<T>,
+        ));
+        let mut evm = Evm::<T>::new_with_execution_config(
+            ExecutionConfig::for_config::<C>(),
+            SpecId::OSAKA,
+            BlockEnv::<T>::default(),
+            TxRegistry::new(),
+            InMemoryDB::default(),
+            precompiles,
+        );
+        let mut message: Message<T> = MessageExt {
+            kind: MessageKind::Call,
+            gas_limit: 1_000_000,
+            destination: PARENT,
+            call_target: PARENT,
+            code: Bytecode::new_legacy(Bytes::from(parent)),
+            code_address: PARENT,
+            ..MessageExt::default()
+        };
+        SEEN.with_borrow_mut(|s| *s = Seen::default());
+        let result = Host::execute_message(&mut evm, &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::Stop);
+        SEEN.with_borrow_mut(core::mem::take)
+    }
+
+    /// The caller's input to [`NOTE_INPUT`]: memory 0..32.
+    fn input() -> Vec<u8> {
+        let mut input = vec![0; 32];
+        input[0] = 0xaa;
+        input
+    }
+
+    #[test]
+    fn the_no_op_hooks_leave_a_call_input_in_the_callers_memory() {
+        let s = run::<NoOp, NoOpConfig>();
+        assert!(s.memory.is_some());
+        assert_eq!(s.input, s.memory);
+        assert_eq!(s.bytes, Some(input()));
+    }
+
+    #[test]
+    fn a_family_that_keeps_the_defaults_has_a_call_input_copied() {
+        let s = run::<Defaulted, DefaultedConfig>();
+        assert!(s.memory.is_some() && s.input.is_some());
+        assert_ne!(s.input, s.memory);
+        assert_eq!(s.bytes, Some(input()));
     }
 }
