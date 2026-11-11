@@ -894,6 +894,44 @@ mod tests {
         assert_eq!(host.execute_message(&mut message).unwrap().stop, InstrStop::Stop);
     }
 
+    /// Compiled code charges gas on the first word of the context's `gas` field, which must be
+    /// the frame's remaining gas.
+    #[test]
+    fn compiled_charge_debits_the_remaining_gas() {
+        unsafe extern "C" fn charge_two(
+            ecx: NonNull<EvmContext<'_, '_, '_>>,
+            _stack: NonNull<EvmStack>,
+            _stack_len: NonNull<usize>,
+        ) -> InstrStop {
+            // The load, debit and signed check the compiler emits for a section costing 2.
+            // SAFETY: The compiled invocation owns the live context.
+            unsafe {
+                let remaining = ecx
+                    .cast::<u8>()
+                    .add(core::mem::offset_of!(EvmContext<'_, '_, '_>, gas))
+                    .cast::<u64>();
+                let left = remaining.read().wrapping_sub(2);
+                remaining.write(left);
+                if (left as i64) < 0 { InstrStop::OutOfGas } else { InstrStop::Stop }
+            }
+        }
+        let mut message = MessageExt {
+            gas_limit: 30_000,
+            code: Bytecode::new_legacy(Bytes::from_static(&[0x5f, 0x00])),
+            ..MessageExt::default()
+        };
+        let mut host = Evm::<BaseEvmTypes>::new(
+            SpecId::OSAKA,
+            BlockEnvExt::default(),
+            TxRegistry::new(),
+            EmptyDB::default(),
+            NoPrecompiles::default(),
+        );
+        host.set_interpreter_runner(TestRunner(EvmCompilerFn::new(charge_two)));
+        let result = host.execute_message(&mut message).unwrap();
+        assert_eq!((result.stop, result.gas.remaining()), (InstrStop::Stop, 29_998));
+    }
+
     #[test]
     fn conversions() {
         let mut word = EvmWord::ZERO;
