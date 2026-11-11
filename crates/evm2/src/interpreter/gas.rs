@@ -535,6 +535,15 @@ pub struct Gas {
     memory: MemoryGas,
 }
 
+// Compiled code loads the remaining gas as the first word of `Gas`, the first field of its
+// context, and reads the context's later fields at offsets fixed when it was compiled. Compiled
+// artifacts are cached under `ABI_VERSION` (`evm2-jit-codegen`), so a change to this layout must
+// bump it, and then this assertion. The size is pinned on 64-bit targets only: `MemoryGas` holds a
+// `usize`, and `Gas` is 60 bytes on i686.
+#[cfg(target_pointer_width = "64")]
+const _: () =
+    assert!(core::mem::size_of::<Gas>() == 64 && core::mem::offset_of!(Gas, tracker) == 0);
+
 impl Gas {
     /// Creates gas with `limit` execution gas.
     #[inline]
