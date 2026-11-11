@@ -119,9 +119,12 @@ impl MessageHooks<Types> for Recorder {
         m: &Message<Types>,
         stop: &mut InstrStop,
         out: &mut Bytes,
-        _: &mut GasTracker,
+        gas: &mut GasTracker,
     ) -> Result<(), evm2::ExecutionError> {
         evm.ext_mut().push(format!("before_commit {} {stop:?}", m.call_target));
+        if let Some((remaining, cost)) = gas.failed_charge() {
+            evm.ext_mut().push(format!("failed {remaining} {cost}"));
+        }
         if m.call_target == IDENTITY && stop.is_success() {
             *stop = InstrStop::Revert;
             *out = Bytes::from_static(b"taken back");
@@ -354,6 +357,34 @@ fn code_admission_revert_restores_predeposit_gas_and_rolls_back_creation() {
     assert_eq!(result.gas.remaining(), 292);
     assert_eq!(result.created_address, None);
     assert!(evm.state_mut().account(&address).unwrap().get().is_none());
+}
+
+/// Steps every opcode, so an inspected run takes the inspect table, which zeroes `remaining` on an
+/// out-of-gas step. `NoopInspector` steps nothing and runs the plain loop.
+struct Stepping;
+
+impl evm2::Inspector<Types> for Stepping {}
+
+#[test]
+fn failed_static_debit_survives_inspector_zeroing_without_changing_settlement() {
+    for inspected in [false, true] {
+        let mut evm = evm();
+        if inspected {
+            evm.set_inspector(Stepping);
+        }
+        let mut message = Message::<Types> {
+            gas_limit: 2,
+            destination: CODE,
+            call_target: CODE,
+            code: Bytecode::new_legacy(Bytes::from_static(&[op::PUSH1, 0])),
+            ..Default::default()
+        };
+        let result = Host::execute_message(&mut evm, &mut message).unwrap();
+        assert_eq!(result.stop, InstrStop::OutOfGas, "inspected={inspected}");
+        assert_eq!(result.gas.remaining(), 0);
+        assert_eq!(result.gas.failed_charge(), Some((2, 3)));
+        assert!(evm.ext().iter().any(|s| s == "failed 2 3"));
+    }
 }
 
 /// A call's input is a range of the caller's memory, and every message hook runs while the caller

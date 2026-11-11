@@ -60,10 +60,16 @@ impl super::DispatchGas for RemainingGas {
     #[inline(always)]
     fn pre_step<T: EvmTypesHost, C: EvmConfig<T>>(
         &mut self,
-        _state: &mut InterpreterState<'_, '_, T>,
+        state: &mut InterpreterState<'_, '_, T>,
         op: u8,
     ) -> Result {
-        self.spend(C::OPCODE_CONFIG.static_gas(op) as _)
+        let cost = C::OPCODE_CONFIG.static_gas(op) as u64;
+        let result = self.spend(cost);
+        if result.is_err() {
+            core::hint::cold_path();
+            state.gas_mut().tracker_mut().record_failed_charge(self.get().wrapping_add(cost), cost);
+        }
+        result
     }
 
     #[inline(always)]
