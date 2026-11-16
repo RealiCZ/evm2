@@ -282,23 +282,24 @@ impl CallTraceNode {
         if self.trace.kind.is_delegate() { self.trace.caller } else { self.trace.address }
     }
 
-    /// Iterates over steps in execution order, pairing each step with the child it called.
+    /// Iterates over steps in execution order, pairing each step with the child it started.
     ///
-    /// A child is recorded right after the step that called it, so the node's `ordering` locates
-    /// it. A call opcode without a following child either failed before entering a frame, e.g. due
-    /// to out of gas (<https://github.com/paradigmxyz/reth/issues/3915>), or called an excluded
-    /// precompile that was not attached to this node.
+    /// A child is recorded right after the step that started it, so the node's `ordering` locates
+    /// it. That step is a call or create opcode, or an instruction a type family installed that
+    /// runs a message at another opcode. A call opcode without a following child either failed
+    /// before entering a frame, e.g. due to out of gas
+    /// (<https://github.com/paradigmxyz/reth/issues/3915>), or called an excluded precompile that
+    /// was not attached to this node.
     pub(crate) fn steps_with_children(&self) -> impl Iterator<Item = CallTraceStepStackItem<'_>> {
         let mut ordering = self.ordering.iter().peekable();
         self.trace.steps.iter().enumerate().map(move |(step_idx, step)| {
             ordering
                 .find(|member| matches!(member, TraceMemberOrder::Step(idx) if *idx == step_idx));
-            let call_child_id = match ordering.next_if(|member| {
-                step.is_call_like_op() && matches!(member, TraceMemberOrder::Call(_))
-            }) {
-                Some(TraceMemberOrder::Call(child)) => self.children.get(*child).copied(),
-                _ => None,
-            };
+            let call_child_id =
+                match ordering.next_if(|member| matches!(member, TraceMemberOrder::Call(_))) {
+                    Some(TraceMemberOrder::Call(child)) => self.children.get(*child).copied(),
+                    _ => None,
+                };
             CallTraceStepStackItem { trace_node: self, step, call_child_id }
         })
     }

@@ -347,8 +347,10 @@ impl ParityTraceBuilder {
                     let mut precompiles =
                         precompiles.remove(&current.idx).unwrap_or_default().into_iter();
 
-                    // A child is recorded right after the step that called it, so a call step
-                    // without a following child either halted or called an excluded precompile.
+                    // A child is recorded right after the step that started it, whatever its
+                    // opcode: a type family's instruction may run a message too. A call step
+                    // without a following child either halted or called an excluded precompile,
+                    // which only a call opcode is matched with.
                     let mut ordering = current.ordering.iter().peekable();
                     let mut deltas = current.trace.step_deltas.iter().peekable();
                     while let Some(member) = ordering.next() {
@@ -359,19 +361,20 @@ impl ParityTraceBuilder {
                         if !began_executing(step, current.trace.bytecode.as_ref()) {
                             continue;
                         }
-                        let maybe_sub_call = if step.is_call_like_op() && !step.is_error() {
+                        let maybe_sub_call = if step.is_error() {
+                            None
+                        } else {
                             match ordering.next_if(|next| matches!(next, TraceMemberOrder::Call(_)))
                             {
                                 Some(TraceMemberOrder::Call(child)) => {
                                     children.get_mut(*child).and_then(Option::take)
                                 }
-                                _ => precompiles
+                                _ if step.is_call_like_op() => precompiles
                                     .next()
                                     .filter(|node| entered_frame(node))
                                     .map(|_| VmTrace::default()),
+                                _ => None,
                             }
-                        } else {
-                            None
                         };
 
                         instructions.push(self.make_instruction(step, delta, maybe_sub_call));
