@@ -1,4 +1,5 @@
-//! Amsterdam step costs leave out state gas, in both trace formats.
+//! Amsterdam step costs leave out state gas, in both trace formats, the JavaScript tracer's
+//! `getCost` and the opcode gas inspector.
 //!
 //! The expected values come from go-ethereum `a0cba163b1f17f6044df84502ff13036dffb5de1`
 //! (`evm 1.17.11-unstable-a0cba163`): the interpreter passes each opcode's execution and state
@@ -6,12 +7,20 @@
 //! (core/tracing/hooks.go, `EmitOpcode`).
 
 use super::*;
+use crate::utils::{InspectorSlot, ResultAndState, TestEvmWithInspector};
+use evm2::interpreter::opcode::OpCode;
+use evm2_inspectors::opcode::OpcodeGasInspector;
 
 /// Transaction gas limit that leaves a reservoir of 100,000 gas, below the 183,600 gas of an
 /// account creation: the gas above the 2^24 transaction cap.
 const SHORT_RESERVOIR_GAS_LIMIT: u64 = 16_777_216 + 100_000;
 /// Transaction gas limit that leaves a reservoir larger than any state charge below.
 const FULL_RESERVOIR_GAS_LIMIT: u64 = 20_000_000;
+/// Transaction gas limit that leaves a reservoir of 50,000 gas, below the state gas of a new
+/// storage slot.
+const HALF_SLOT_RESERVOIR_GAS_LIMIT: u64 = 16_777_216 + 50_000;
+/// State gas of a new storage slot: 64 state bytes at 1530 gas per byte.
+const NEW_SLOT_STATE_GAS: u64 = 64 * 1_530;
 
 /// Returns the cost of each step of `code` in parity `vmTrace` and in geth struct logs, which
 /// must agree, and the state gas of each step.
@@ -116,5 +125,116 @@ fn create_cost_leaves_out_state_gas_spilled_from_a_short_reservoir() {
         let step = call_step_funded(&hex!("5f5f5ff000"), &[], SpecId::AMSTERDAM, 0, gas_limit);
         assert_eq!(step.cost, 12_000);
         assert_eq!(step.used, step.gas_remaining - 12_000 - spilled);
+    }
+}
+
+/// Runs `code` at `0x42` on Amsterdam under `inspector`, with a transaction gas limit of
+/// `gas_limit`.
+fn run_under<I: InspectorSlot>(
+    code: &[u8],
+    gas_limit: u64,
+    inspector: I,
+) -> (TestEvmWithInspector<I>, ResultAndState) {
+    let target = Address::with_last_byte(0x42);
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(
+        &target,
+        AccountInfo::default().with_code(Bytecode::new_raw(code.to_vec().into())),
+    );
+    let mut evm = Context::mainnet()
+        .modify_cfg_chained(|cfg| cfg.spec = SpecId::AMSTERDAM)
+        .with_db(db)
+        .build_mainnet_with_inspector(inspector);
+    let res = evm
+        .inspect_tx(TxEnv { gas_limit, kind: TransactTo::Call(target), ..Default::default() })
+        .unwrap();
+    assert!(res.result.is_success(), "{res:#?}");
+    (evm, res)
+}
+
+#[test]
+fn step_tracers_agree_on_a_spilled_sstore() {
+    // The struct logger and the VM trace (which `step_costs` holds equal), the opcode gas
+    // inspector and the JavaScript tracer's `getCost` cost each step alike, leaving out the new
+    // slot's state gas whether it spills past the reservoir in full, in part or not at all. The
+    // spill shows in the gas the next step starts with.
+    let code = hex!("602a5f5500");
+    for (gas_limit, spilled) in [
+        (1_000_000, NEW_SLOT_STATE_GAS),
+        (HALF_SLOT_RESERVOIR_GAS_LIMIT, NEW_SLOT_STATE_GAS - 50_000),
+        (FULL_RESERVOIR_GAS_LIMIT, 0),
+    ] {
+        let (costs, state_costs) = step_costs(&code, 0, gas_limit);
+        assert_eq!(costs, [3, 2, 12_100, 0]);
+        assert_eq!(state_costs[2], Some(NEW_SLOT_STATE_GAS as i64));
+        let inspector = inspect_funded_code(
+            &code,
+            &[],
+            SpecId::AMSTERDAM,
+            TracingInspectorConfig::default_geth(),
+            0,
+            gas_limit,
+        );
+        let steps = &inspector.traces().nodes()[0].trace.steps;
+        assert_eq!(steps[3].gas_remaining, steps[2].gas_remaining - 12_100 - spilled);
+
+        let mut counter = OpcodeGasInspector::default();
+        drop(run_under(&code, gas_limit, &mut counter));
+        let opcode_gas = counter.opcode_gas();
+        for (opcode, cost) in [(op::PUSH1, 3), (op::PUSH0, 2), (op::SSTORE, 12_100)] {
+            assert_eq!(opcode_gas[&OpCode::new(opcode).unwrap()], cost, "{opcode:#x}");
+        }
+
+        #[cfg(feature = "js-tracer")]
+        {
+            let tracer = r#"{
+                costs: [],
+                step: function(log) { this.costs.push(log.getCost()); },
+                fault: function() {},
+                result: function() { return this.costs; }
+            }"#;
+            let js = evm2_inspectors::tracing::js::JsInspector::new(
+                tracer.to_string(),
+                serde_json::Value::Null,
+            )
+            .unwrap();
+            let (mut evm, res) = run_under(&code, gas_limit, js);
+            let (context, js) = evm.ctx_inspector();
+            let (tx, block) = (context.tx().envelope(), *context.block());
+            let got = js.json_result(&res.tx_result, &tx, &block, context.db_mut()).unwrap();
+            assert_eq!(got, serde_json::json!(costs), "JavaScript getCost");
+        }
+    }
+}
+
+#[test]
+fn opcode_gas_nets_a_call_of_its_child_without_the_child_spill() {
+    // A cold CALL forwarding all it can to a child that writes a new slot: the CALL's own gas is
+    // its cold access alone, whether the child's state gas spills past the reservoir or not, and
+    // the child's SSTORE costs its 12,100.
+    let code = hex!("5f5f5f5f5f60435af100");
+    for gas_limit in [1_000_000, FULL_RESERVOIR_GAS_LIMIT] {
+        let target = Address::with_last_byte(0x42);
+        let child = Address::with_last_byte(0x43);
+        let mut db = InMemoryDB::default();
+        for (address, code) in [(target, &code[..]), (child, &hex!("602a5f5500")[..])] {
+            db.insert_account_info(
+                &address,
+                AccountInfo::default().with_code(Bytecode::new_raw(code.to_vec().into())),
+            );
+        }
+        let mut counter = OpcodeGasInspector::default();
+        let mut evm = Context::mainnet()
+            .modify_cfg_chained(|cfg| cfg.spec = SpecId::AMSTERDAM)
+            .with_db(db)
+            .build_mainnet_with_inspector(&mut counter);
+        let res = evm
+            .inspect_tx(TxEnv { gas_limit, kind: TransactTo::Call(target), ..Default::default() })
+            .unwrap();
+        assert!(res.result.is_success(), "{res:#?}");
+        drop(evm);
+        let opcode_gas = counter.opcode_gas();
+        assert_eq!(opcode_gas[&OpCode::new(op::CALL).unwrap()], 3_000, "gas limit {gas_limit}");
+        assert_eq!(opcode_gas[&OpCode::new(op::SSTORE).unwrap()], 12_100, "gas limit {gas_limit}");
     }
 }
